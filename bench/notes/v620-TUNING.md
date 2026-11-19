@@ -163,6 +163,14 @@ Decision: **PP=2 promoted — the promotion checklist passed on 11-19.**
 - Daily configs updated with `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2` (§6.36 of the migration notes
   carries the same verdict).
 
+**R1b-side note — F-3 (out-norm decouple) tested and rejected, 11-19 evening.** The +419 ms
+out-norm regression behind this task was patched as `STRATA_GDN_OUTNORM=0` (opt-in, 6 lines) and
+quick-tested: +1.7% at 64k on one pass, but med-of-3 **lost at every tier** (−1.0% to −2.1%; full
+row in §5.2, write-up in §6.37 of the migration notes). Patch reverted. Lesson kept for every task
+below: the phase timer's per-phase numbers can mislead when launches overlap (the old kernel's
+`T×HV`-block grid bled into the next phase's window); judge by GPU timeline and end-to-end tok/s,
+and never promote off a single pass — the ordering/thermal effect alone was worth ±1.7%.
+
 ## R2 — Expert i8 tile GEMM shape on the V620 (26–28% of prefill)
 
 **What runs today.** `i8_kernel<T, GU>` in `i8_expert.cuh`: 64 weight rows × 16 token-entries

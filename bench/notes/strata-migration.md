@@ -380,6 +380,10 @@ mostly the batch flip, not the other changes listed.
 │        │ one round, ran second and warmest (bias would understate it) │               │               │               │               │
 │ 11-19  │ Same base + F-2 + GDN quad path (STRATA_GDN_HEAD=1          │ 1049.1/92.1   │ 1046.0/92.3   │ 1044.2/94.3   │ 1027.1/89.5   │
 │        │ STRATA_GDN_PP=2, env-only; gdn recurrence -51%; see §6.36)   │               │               │               │               │
+│ 11-19  │ Same base + F-2 + GDN quad path - med-of-3 (both arms same   │ 1023.0/96.1   │ 1024.3/96.7   │ 1036.0/94.1   │ 1024.0/89.1   │
+│        │ evening, baseline last and warmest; promoted; see §6.36)     │               │               │               │               │
+│ 11-19  │ Same + STRATA_GDN_OUTNORM=0 (F-3: old out-norm launch) -     │ 1007.5/94.7   │ 1014.1/94.2   │ 1022.4/91.8   │ 1002.4/91.3   │
+│        │ REJECTED, med-of-3 loses every tier; patch reverted; §6.37   │               │               │               │               │
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
 
 ### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
@@ -750,3 +754,17 @@ med-of-3 (both arms same evening, baseline last and warmest) gives 128k PP 1024.
 thermal bias running against the winner. The `STRATA_STATE_HASH_GDN=1` cross-arm check returned
 identical state hashes, so the quad path is bit-exact on this card. The daily F-2 config now
 carries `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`.
+
+**6.37 F-3: the out-norm decouple — rejected (11-19 evening).** The phase tables said the quad
+path's paired grid-stride out-norm kernel loses ~940 ms to the old per-token launch at 128k, so F-3
+added `STRATA_GDN_OUTNORM=0` to variant 1 (6 lines in `kernels.cu`, default unchanged) and the quick
+test read +1.7% at 64k on one pass. Med-of-3 said no: **1007.5/1014.1/1022.4/1002.4** vs PP2's
+1023.0/1024.3/1036.0/1024.0 — a loss at every tier (−1.0% to −2.1%), patch reverted from the F-2
+branch. Two lessons recorded. First, the single-pass 64k win was thermal ordering, not code: the F-3
+arm ran first on a cooler card and its own three passes sagged monotonically (1033.5→1022.4→1022.2);
+only med-of-3 comparisons mean anything, exactly as §3.1 says. Second, the phase table misled: the
+per-token launch (`T×HV` blocks, ~6.4 M at 128k) overlaps into the next phase's measurement window,
+so `gdn out proj` looked −944 ms while `gdn recurrence` looked +3.6 s worse; the GPU timeline and
+end-to-end tok/s are the judges. The upstream "one-line decouple" proposal is withdrawn on this
+card's evidence. The `on0` config (`~/strata-v620-iq3_s-T9-0216-f2-gdn-pp2-on0.json`) and logs stay
+as the record.
