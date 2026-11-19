@@ -261,6 +261,39 @@ bandwidth and hit rate are. **[unmeasured]** — no decode phase timer exists ye
 **Payoff ceiling.** Unknown until measured — could be the largest single lever on the TG
 column, or nothing. That is exactly why it needs the timer first.
 
+## Session state (end of 11-19 evening; update after every session)
+
+**Verdicts so far.** R1a promoted and closed: `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`
+is in the daily configs, med-of-3 +3.75% at 128k, bit-exact per the state-hash
+check. R1's out-norm side quest (F-3, `STRATA_GDN_OUTNORM=0`) tested and
+**rejected** — loses every tier in med-of-3; patch reverted from the F-2 branch;
+the phase-timer lesson (launch overlap, ±1.7% single-pass ordering effects) is
+recorded in §6.37 of the migration notes and under R1 here.
+
+**Current best full tier** (F-2 + GDN PP=2, med-of-3, 11-19): PP 1023.0 / 1024.3 /
+1036.0 / 1024.0, TG 96.1 / 96.7 / 94.1 / 89.1. §5.2 row in the migration notes.
+
+**Machine state.** The F-2 worktree (`~/git/wt-0216-f2`) is at `f786675dc` with a
+clean tree — F-3 was reverted, so the binary in `build-hip` matches the branch
+tip. The config still carrying the rejected env is
+`~/strata-v620-iq3_s-T9-0216-f2-gdn-pp2-on0.json`; leave it as the record, do not
+serve it. After the reboot nothing serves: boot the daily with
+
+    cd ~/git/Strata && setsid nohup .venv/bin/python serve/server.py \
+      --engine strata --config /home/drewster/strata-v620-iq3_s-T9-0216-f2.json \
+      > /tmp/boot-daily.log 2>&1 < /dev/null & disown
+
+(the ready banner goes to stdout, i.e. /tmp/boot-daily.log, not the engine log —
+that cost us a false "hang" once already).
+
+**Docs state.** Everything through the F-3 rejection is committed on this branch
+(`593a90174`, `25927ac25`). The migration notes carry §5.2 rows, §6.36
+(promotion), §6.37 (F-3 rejection).
+
+**Next up (queue).** R5 — the decode-timing patch (`STRATA_DECODE_TIMING`), the
+small change that unblocks the whole TG half of this file. Then R2's sweep, then
+R3's internal split. No TG ranking exists until R5 lands.
+
 ---
 
 ## Order of attack
