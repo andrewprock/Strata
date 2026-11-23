@@ -1,0 +1,814 @@
+# Strata on the V620 — Working Record
+
+What this is: the working notes for running Qwen3.8-Flash-Next locally on one AMD Radeon Pro V620,
+covering the move from Ollama to Strata (October 2026) and every speed experiment since.
+Started 2026-10-12. Rewritten for readability 2026-11-17.
+
+**Where the fine detail went.** This file is the day-to-day reference: what is running, how to run a
+benchmark, what was decided and how to redo any experiment. The fine detail (full logs, per-phase
+timing tables, theories that went nowhere) lives in git history:
+`git show c8d3f3b2:bench/notes/strata-migration.md` (the pre-cleanup original, 1,282 lines), plus the
+benchmark result files in `~/git/llm-benchmark/results/` (named per experiment below).
+
+---
+
+## 1. Words used in this document
+
+**Speed words**
+
+- **Reading speed (PP)** — how fast the model reads a prompt, in tokens/second. The reliable number:
+  varies only ±0.3% between identical runs. Older shorthand: "PP" (prompt processing).
+- **Writing speed (TG)** — how fast the model writes its answer, in tokens/second. Noisy: identical
+  runs vary ±3–4%, and even day to day on an unchanged build (seen: 92.6 one day, 87.9 the next).
+  Older shorthand: "TG" (token generation). Never trust a single-run writing-speed comparison.
+- **Tier** — a tested prompt length: 16k / 32k / 64k / 128k tokens. A benchmark "pass" runs all four.
+- **med-of-3** — the middle value of 3 runs. One warm-up run (the "soak") is always discarded first,
+  because a cold machine reads ~2–5% faster than a warm one.
+- **A/B** — two configurations alternated and compared, ideally interleaved (boot A, boot B, boot A, …)
+  so machine drift hits both equally.
+
+**Model words**
+
+- **Quantization level (IQ3_S, IQ2_XS, IQ1_M, Q4_K_M…)** — how strongly the model's weights were
+  compressed. Roughly "bits per weight": Q4 ≈ 4-bit, IQ3_S ≈ 3.1-bit, IQ2_XS ≈ 2.5-bit, IQ1_M ≈ 1.6-bit.
+  Lower = smaller and faster to read, but less accurate. **UD-** means Unsloth's "Dynamic" brand of
+  mixed-precision compression.
+- **Daily driver** — the setup used for real work (as opposed to test lanes).
+- **Generation 1–5** — the five daily-driver setups over time, in order. (Older notes called them
+  v1–v5.) All five are defined with dates and contents in §2.4.
+- **MTP / draft head / 5-token drafting** — the model ships with a small extra head that guesses the
+  next 5 tokens while the main model writes one; correct guesses are free speed. Strata calls the
+  feature "spec" (speculative decoding); the knob `--spec 5` turns on 5-token drafting.
+
+**Hardware and build words**
+
+- **V620 / gfx1030 / RDNA2** — the GPU card; gfx1030 is its chip family code. **ROCm** is AMD's
+  equivalent of CUDA. **HIP** is AMD's CUDA-like kernel language.
+- **F-2** — our best engine change (2026-10-20): skip a float16-widening step inside the attention-mix
+  path. Output is bit-identical, work is 3% less. Enabled with env flag `STRATA_HC_MIX_H16=1`.
+- **T9 recipe** — the draft-vocabulary trick (2026-10-23): point the 5-token draft head at a smaller,
+  English-only vocabulary file. Flag `--mtp-draft-vocab …/draft_vocab_en.bin`.
+- **PLE** — "prompt-time expert batching" (env flag `STRATA_PLE_BATCH=1`): process the expert matrices
+  in batches while reading a prompt instead of one token at a time. Flipped on 2026-10-19; worth
+  +12–14% reading speed by itself. **All speed rows before that date were measured with the slow
+  batching** — see the caveat above the table in §5.2.
+- **MMQ patches** — our patches (2026-11-04) to the expert matrix-multiply kernels so they use AMD's
+  packed-FP16 instructions (VOP3P). They live on a branch of the bundled llama.cpp:
+  `v620-mmq-vop3p` on the GitHub fork `andrewprock/llama.cpp`.
+- **CPU offload / persistent hc** — the two env flags added 2026-11-03: `STRATA_PREFILL_CPU_SHARE=1`
+  (the CPU takes a share of prompt-processing work, helping short prompts) and `STRATA_HC_PERSIST=1`
+  (keeps per-conversation computation state resident, cutting time-to-first-token ~12% on short prompts).
+- **Parking** — keeping the conversation cache (KV) resident in VRAM between requests (8192 MiB,
+  flag `--conversation-cache-mib`). ON for real use (switching conversations costs 1 s instead of
+  18–100 s of re-reading), OFF for benchmarks (a benchmark never revisits a conversation, so parking
+  would only charge it a small eviction tax and muddy the comparison).
+- **Worktree** — a second checkout of the same git repo in another directory, so each build keeps
+  its own folder. `~/git/v620-gfx1030-tuned` is where the current daily build lives.
+- **Fork** — our copy of a repo on GitHub (`andrewprock/Strata`, `andrewprock/llama.cpp`) where
+  branches are pushed for safekeeping.
+- **E483 rule** — if a setting changes *which* computation paths run, measure it on real text, never
+  synthetic prompts (a synthetic-positive/real-negative lesson from ticket E483).
+
+---
+
+## 2. What is running right now (as of 2026-11-23)
+
+### 2.1 The computer
+
+- Azure NVv5-class virtual machine: Threadripper PRO 3975WX (32 cores), **one V620 with 32 GB VRAM**
+  (gfx1030/RDNA2, 40 compute units), 207 GB RAM. ROCm 10.0 at `/opt/rocm`.
+- Models live on a 984 GB disk mounted at `/var/lib/ollama` (~215 GB free).
+- Power is deliberately capped at ~180 W (of the card's 265 W spec). Under load the chip settles at
+  ~85 °C; clocks wander 1520–2470 MHz. `rocm-smi --setperfdeterminism` is not supported on this card.
+- The OS memory-lock limit is 8 MiB, so the engine's big table mlock always fails — harmless but noisy;
+  fixing it needs sudo (still pending, §8).
+
+### 2.2 What is being served at this moment
+
+- **The generation-6 stack (IQ3_S)** — 0.2.20-dev + our F-2 change + the GDN quad-path env
+  (§2.4, §6.38), serving on port 8080 since 2026-11-23. Model id `qwen3.8-flash-next-iq3_s-draftvocab-en`, config
+  `~/strata-v620-iq3_s-T9-v6.json`. The 11-09 UD-IQ1_M real-work trial ended 11-18 (its /tmp configs
+  were wiped on reboot; §6.32 has the recipe to recreate the lane). It remains the fastest lane ever
+  measured at 16k (§5.4).
+- The wrapper `~/bin/strata-serve` manages it: `stop`, `logs`, `status`, or bare to run in foreground.
+  It now starts the generation-6 config. Logs: `~/engines/logs/daily.log` (wrapper tee) and
+  `~/engines/logs/daily-engine.log` (the config's `log` key).
+
+### 2.3 How to get back to the usual daily setup
+
+- The daily config file is `~/strata-v620-iq3_s-T9-v6.json` (generation 6: the same knobs as before,
+  pointed at the same binary path as v5 -- the path is the stable daily home, its contents change
+  with each generation -- and at the 0.2.16-layout file paths under `terminal/`). The previous daily
+  configs stay next to it untouched: `...-v5.json` (generation 5), `...-draftvocab.json`
+  (generations 2-4; backups `.bak-pre-v2`, `.bak-pre-mmq`, `.bak-pre-v4` mean "before generation
+  2/3/4").
+- Restoring = stop the current server and start one with the wanted config instead (§3.4).
+- Older binaries for instant fallback: `~/engines/backup/strata-0.2.15-dev-f2-mmq` (generation 5),
+  `strata-0.1.55-f2-mmq` (3), `strata-0.1.55-f2` (2), `strata-0.1.48.1-f2` (1). The daily build
+  lives at `~/git/v620-gfx1030-tuned/build-hip/strata` (branch `v620-gfx1030-tuned`).
+
+### 2.4 The six generations of the daily driver (all defined)
+
+┌────────────────────────┬─────────────┬────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+│ Name                   │ Date        │ What it actually is                                                                │ Where it lives                                     │
+├────────────────────────┼─────────────┼────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ Generation 1           │ 2026-10-25  │ Strata 0.1.48.1 + the F-2 change (skip-widen). The reference build for all A/Bs    │ ~/engines/backup/strata-0.1.48.1-f2 (binary)       │
+│                        │             │ since.                                                                             │                                                    │
+├────────────────────────┼─────────────┼────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ Generation 2           │ 2026-11-03  │ Newer base: Strata 0.1.55 + F-2 (promoted 11-02 after a two-round A/B), plus two   │ ~/git/wt-0155, commit ff9d98b0; the env flags live │
+│                        │             │ env flags added to the config: CPU offload and persistent hc.                      │ in the config file                                 │
+├────────────────────────┼─────────────┼────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ Generation 3           │ 2026-11-04  │ Generation-2 base + our patched expert kernels (the MMQ/VOP3P work on the bundled  │ ~/git/wt-mmq, branch v620-daily-0155-f2 (on the    │
+│                        │             │ llama.cpp).                                                                        │ fork)                                              │
+├────────────────────────┼─────────────┼────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ Generation 4           │ 2026-11-05  │ Strata 0.2.10 + F-2 (clean cherry-pick, commit 434dfe91) + the patched expert      │ ~/git/wt-stack, branch v620-stack-0210-f2-mmq (on  │
+│                        │             │ kernels.                                                                           │ the fork)                                          │
+├────────────────────────┼─────────────┼────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+│ Generation 5           │ 2026-11-18  │ New upstream main (0.2.15-dev, commit c77572806) + F-2 (cherry-pick                │ ~/git/v620-gfx1030-tuned, same-named branch (on    │
+│                        │             │ 749cfbb18) + our MMQ patches, now commits inside the vendored ggml.                │ the fork); config ~/strata-v620-iq3_s-T9-v5.json   │
+│ Generation 6 (current) │ 2026-11-23  │ New upstream main (0.2.20-dev, commit 73d4f4196, after the 0.2.16                  │ ~/git/v620-gfx1030-tuned, same-named branch (on    │
+│                        │             │ layout move) + F-2 (cherry-pick 80e4a0a48) + the GDN quad                          │ the fork); config ~/strata-v620-iq3_s-T9-v6.json   │
+│                        │             │ path env (6.38). No MMQ: upstream deleted that build path.                         │                                                    │
+└────────────────────────┴─────────────┴────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+
+The patched-kernels part: 3 commits on the engine's exact llama.cpp pin (`3cf03257f`) — packed-FP16
+dot chains for the q8_0 and IQ2-family kernels, plus a helper (`56ccab041`). For generations 2-4 the
+engine builds them in via `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` pointing at that checkout (0.1.55
+has no `STRATA_GGML_DIR` option; 0.2.10 pins the same llama.cpp commit at CMakeLists line 2110, so the
+patches drop in unchanged). Since 0.2.15-dev the ggml is vendored at `third_party/strata-ggml`, and
+generation 5 carries the same 3 patches as commits in the worktree itself. The patched llama.cpp
+checkout also lives at `~/git/llamacpp-mmq` (branch `v620-mmq-vop3p` on the fork) for the older bases.
+Upstream 0.2.16 then removed the whole llama.cpp MMQ build path (options, vendored ggml-cuda,
+everything) in favor of Strata's own prompt kernels, so generations 6+ cannot carry those patches
+-- there is nothing left to patch. The MMQ work measured +0.5-1.0% while it existed; the
+own-kernels rewrite reached the same speed on its own (experiment 35).
+
+### 2.5 Models on the disk (as of 11-17)
+
+- **`IQ3_S/` (78 GB, 2 shards)** — the daily-driver weights (3.1-bit, "GSQ-RCO" build). These are the
+  live daily shards: never delete while an engine is running.
+- **`unsloth-iq1m/` (68 GB), `unsloth-iq2xs/` (78 GB)** — the two Unsloth lanes benched 2026-11-06;
+  parked (not deleted). Packs for them: `~/git/Strata-data/packs/{iq1m,iq2xs}`; configs
+  `/tmp/ud-iq{1m,2xs}.json`.
+- **`IQ3_S-abl/` (80 GB)** — the abliterated (refusal-removed) copy of the daily weights; pack at
+  `packs/iq3_s-abl`. **`maya-models/` (238 GB)** — user-managed, not Strata's. **`mtp-draft/` (2.8 GB)** —
+  the draft head.
+- The Ollama service (systemd) is separate software with its own 9 models (~162 GB); the user manages
+  it (`ollama rm` is the clean way to remove those).
+- Deleted lanes (kept in history): DeepSeek-V4.1-Flash at 2.5-bit (275 GB, deleted 11-06 at the user's
+  request), the Unsloth 4-bit lane, the abliterated-v2 variant, IQ3_XXS, the coder 1-bit, and the whole
+  Q4_K_XL/Q5/Q6/Q8 family (k-quant experts are a dead end on this engine — §4.2, §6.13).
+
+---
+
+## 3. Standing procedures (how we do things here)
+
+### 3.1 Setting up a benchmark run
+
+1. **Build clean, with the right flags.** The flags (setup's defaults — a hand-built binary missing
+   them silently loses ~25% reading speed):
+   `-DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=OFF -DSTRATA_Q6K_EXPERTS=OFF
+   -DCMAKE_HIP_ARCHITECTURES=gfx1030` plus Release mode. In words: AMD backend on, the new
+   prompt-time matrix kernels on, k-quant expert kernels off (they don't exist for GPUs), gfx1030 target.
+   Gotchas: the option is spelled `STRATA_ENABLE_HIP` (not `STRATA_HIP`) and `CMAKE_HIP_ARCHITECTURES`
+   (not `HIP_ARCHITECTURES`). **After changing any flag or base commit, delete `build/` and rebuild
+   from scratch** — incremental rebuilds over stale objects produced two false "regressions" (10-18, 10-25).
+2. **Soak, then count.** One warm-up pass after every engine restart, discarded. Then 3 counted passes,
+   take the middle value. For A/Bs: interleave boots when possible and reverse the order the second
+   day-round; same day, same temperature state. Never compare numbers from different sessions without
+   equalizing the warm-up.
+3. **Parking off for benchmarks** (`--conversation-cache-mib 0`), parking on for real use — why: §1.
+4. **The harness.** `~/git/llm-benchmark/bench_strata_tiers.py` — has NO command-line options; it is
+   configured by environment variables: `STRATA_BASE` (server address), `STRATA_MODEL`, `STRATA_API_KEY`,
+   `TIERS=16k,32k,64k,128k`, `NUM_CTX=135168`, `NUM_PREDICT=1024`, temperature 0. Output is auto-named
+   `strata_tier_pass_<timestamp>.json` into `results/`. Note: draft-head acceptance is NOT exposed via
+   `/v1/status` — read the `drafts accepted X of Y` line from the serve log instead.
+5. **Starting the server.** From the worktree directory:
+   `setsid nohup .venv/bin/python serve/server.py --engine strata --config <json> --port 8080 … & disown`.
+   `--engine strata` is MANDATORY on 0.1.55+ — omitting it starts a bare engine without the server
+   layer (cost us a day on 10-31). Readiness check: `grep ^ready:` in the log. Server logs are
+   append-mode: to inspect only a fresh boot, record a byte offset first.
+
+### 3.2 Rules about measuring (each one earned the hard way)
+
+- **Noise floors.** Warm reading speed ±0.3%; writing speed ±3–4% within a day and worse across days.
+  **Treat any single-pass writing-speed delta inside ±4% as noise.** The writing pass also varies in
+  length (388–619 tokens per pass) because the model sometimes stops early.
+- **Real text, not synthetic (the E483 rule).** For any switch that changes which computation paths
+  run: synthetic prompts gave +2.8% while real text gave −1.6%/+9.9% for the same flag. Synthetic
+  results are a hint, never a verdict.
+- **Temperature epochs.** A cool machine reads ~2–3% faster than a settled one. Same-day A/Bs: compare
+  first-pass to first-pass, or re-soak between arms (the 10-19 evening sweep drifted −0.3% to −4.1% across tiers within one session).
+- **Phase timers over-count.** `STRATA_PREFILL_TIMING=1` reports sums ~113% of real time because it
+  double-counts work running on parallel streams. Fine for "where did time go", never for totals.
+  Keep it in bench configs, out of the daily config.
+- **Trust the binary, not the plan.** Before quoting a flag's effect, confirm the binary contains the
+  gate (`strings <binary> | grep <FLAG>`) — on 10-24 an env var was set against an older binary and the
+  flag was silently inert.
+- **`pkill -f` self-matches.** It kills the calling shell too. Use bracketed patterns (`server[.]py`)
+  or `pkill -x`, and never put the pkill and the restart in the same shell command (the restart gets
+  SIGTERM'd; this bit us twice).
+
+### 3.3 Checking that a change didn't break anything
+
+- **Byte-identical smoke.** With temperature 0, a fixed 96-token prompt must produce identical output
+  vs the incumbent build. Or: the in-server parity check (`STRATA_HC_UPMIX_CHECK=2` **together with**
+  `STRATA_HC_UPMIX=1` — without the second variable the check silently runs nothing on gfx1030).
+- **Recall harness.** `~/git/llm-benchmark/halo_needle.py` — 15 needle questions in long context;
+- **The byte-identical smoke is dead as a plain-request test (found 11-19).** Two identical temperature-0
+  requests in one boot give different text on generation 5 (0.2.15-dev) AND on 0.2.16 tip — with the seed
+  pinned, with drafting off, and with CPU offload off; the very first tokens diverge (§6.35). Use the in-server
+  parity check (`STRATA_HC_UPMIX_CHECK=2` together with `STRATA_HC_UPMIX=1`) for bit-level checks; it still
+  works (exact zero for the ported F-2 on 0.2.16). Root cause open (§8).
+  a good change scores 15/15 (§6.12).
+
+### 3.4 Stop / start of the daily server (exact commands)
+
+Stop: `~/bin/strata-serve stop` (or `pkill -x strata`). Start from the build's worktree, e.g.
+`cd ~/git/v620-gfx1030-tuned && setsid nohup .venv/bin/python serve/server.py --engine strata --config
+~/strata-v620-iq3_s-T9-draftvocab.json --port 8080 > ~/engines/logs/daily.log 2>&1 < /dev/null & disown`.
+Wait for `^ready:` in the log before sending traffic.
+
+---
+
+## 4. What we adopted, what we rejected (one line each)
+
+Numbers are med-of-3 tier results. Full detail: the matching entry in §6, or git history.
+
+### 4.1 Adopted — all of these are in the current daily setup
+
+┌────────────────────────────────────┬────────────────────┬──────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────┐
+│ What                               │ When               │ Result                                               │ Where it lives now                                           │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ ROCm tuning table (upstream PR     │ 10-14              │ Reading +1.2-2.7% on every tier, writing unchanged   │ env `STRATA_ROCBLAS_TUNING` (absolute path) + `lib_dirs:     │
+│ #1167)                             │                    │                                                      │ [/opt/rocm/lib]` in config                                   │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ SIMT1 scorer (upstream PR #1151)   │ 10-14              │ 64k +2.7%, 128k +8.6% reading speed (bigger than the │ env `STRATA_SELECT_SIMT=1`                                   │
+│                                    │                    │ author's +3.2% - single card, no split)              │                                                              │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ DPP wave-reduce (a small kernel    │ 10-14              │ Reading +0.3-1.0%, bit-identical output; now         │ in the tree (commit `48d6aa11` lineage)                      │
+│ fix)                               │                    │ upstream                                             │                                                              │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Batched expert reading (PLE)       │ 10-19              │ Reading +11.6-14.0% every tier, writing +2.3-6%      │ env `STRATA_PLE_BATCH=1` (see the caveat above the           │
+│                                    │                    │                                                      │ section-5.2 table)                                           │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Calibration recipe (upstream PR    │ 10-22              │ Writing +~13% vs uncalibrated, same build            │ `--pcie-frac 0.00`, `--spec-min-p 0.70`, env                 │
+│ #1992)                             │                    │                                                      │ `STRATA_SH_STREAM=1`                                         │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Draft-vocabulary recipe (T9)       │ 10-23              │ Chat writing +5.2%, agent writing +6.8%, reading     │ `--mtp-draft-vocab` + `/home/drewster/git/Strata-            │
+│                                    │                    │ cost zero                                            │ main/data/draft_vocab_en.bin`                                │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ 5-token drafting + window          │ 10-15              │ Writing +6.2-8.5%, reading flat                      │ `--spec 5 --spec-min-p ... --mtp-window 8192`                │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ F-2 (skip-widen)                   │ 10-20, promoted    │ -3.2% GPU timeline at 33k, output bit-identical      │ env `STRATA_HC_MIX_H16=1`                                    │
+│                                    │ 10-24              │                                                      │                                                              │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ CPU offload + persistent hc        │ 11-03              │ Short-prompt time-to-first-token -12%; writing       │ env `STRATA_PREFILL_CPU_SHARE=1`, `STRATA_HC_PERSIST=1`      │
+│                                    │                    │ +2.3-4.8%                                            │                                                              │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Patched expert kernels (MMQ/VOP3P) │ 11-04              │ Reading +0.9-1.4% every tier, writing a wash         │ llama.cpp branch `v620-mmq-vop3p` on the fork                │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Strata 0.2.10 base                 │ 11-05              │ Reading +0.4% vs generation 3 (8/8 interleaved       │ worktree `wt-stack`                                          │
+│                                    │                    │ pairs); +4.7% vs generation 1                        │                                                              │
+├────────────────────────────────────┼────────────────────┼──────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+│ Strata 0.2.15-dev base             │ 11-18              │ Reading +3.2-3.3% vs generation 4 at every tier      │ worktree wt-0215-f2; wrapper + config updated                │
+│ (generation 5)                     │                    │ (three-arm A/B, med-of-3 per arm)                    │                                                              │
+└────────────────────────────────────┴────────────────────┴──────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+0.2.16 note (11-19): upstream removed llama.cpp's MMQ build path in 0.2.16 ("own-stack step 10"; the
+vendored ggml no longer carries ggml-cuda), so the MMQ/VOP3P row has no target on 0.2.16 or later — it stays
+valid for 0.2.15 and earlier bases. Every other row's switch still exists at 0.2.16, and `STRATA_HIP_PROMPT_F16=1`
+became the default there on gfx1030/gfx1031.
+
+### 4.2 Measured and rejected — do not re-test without new evidence
+
+┌────────────────────────────────────────────────┬──────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ What                                           │ Verdict (when)           │ Why, in one line                                                                                   │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ SIMT2 scorer (`STRATA_SELECT_SIMT=2`)          │ retired 11-03            │ loses reading speed on every tier, -9.9% at 128k, the loss grows with context                      │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ rocBLAS self-tune on this card                 │ retired 10-14 / re-      │ 56/112 kernel shapes pick differently than the shipped table, but tier deltas +/-0.2% = noise      │
+│                                                │ checked 11-03            │                                                                                                    │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ `STRATA_DENSE_MMQ`, `STRATA_TOPK_STREAM=0`     │ retired 11-03            │ their apparent gains matched session drift; nothing real at any tier                               │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ `STRATA_IO_THREADS`,                           │ retired 11-03            │ passed on synthetic text, failed on real text (E483 rule)                                          │
+│ `STRATA_PIPED_CONCURRENT`,                     │                          │                                                                                                    │
+│ `STRATA_PREFILL_STREAM_MIN`                    │                          │                                                                                                    │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ DOT2 attention score path                      │ abandoned 10-19          │ 1.9x faster in a micro-benchmark, 1.48x SLOWER in the engine (fixed per-block cost); opt-in flag   │
+│                                                │                          │ `STRATA_ATTN_DOT2` remains in the tree, off                                                        │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ reduce12 warp_sum port                         │ abandoned 10-19          │ 1.71x slower on this chip; opt-in flag remains in the tree, off                                    │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ fused_gr/gr kernel extension                   │ abandoned 10-14          │ only 2 of 19 call sites convert bit-identically; the other two produce hash diffs with no pinned   │
+│                                                │                          │ cause                                                                                              │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ gr_upmix GEMM port (S28/S29)                   │ dead 10-19               │ the real waste was the widen step, not the GEMM -> became F-2                                      │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ persistent hc for decode only (upstream PR     │ neutral on one card      │ later re-adopted as part of the 11-03 pair, which does help                                        │
+│ #2226 alone)                                   │ 10-14                    │                                                                                                    │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ PR-A making SH_STREAM a default                │ dropped 10-24            │ reading -2.3-2.5% on its target base (the sign flipped vs an older base - attribution does not     │
+│                                                │                          │ carry across bases)                                                                                │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ k-quant experts (Q4_K_XL/Q5/Q6/Q8 weights)     │ dead end 10-15           │ no GPU kernels exist for k-quant experts; the engine hard-fails; confirmed at scale in the 10-16   │
+│                                                │                          │ matrix                                                                                             │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Ollama-side tweaks                             │ rejected 10-14           │ -27% writing speed; +53 GB RAM for no gain; worse cold-start                                       │
+│ (`OLLAMA_KV_CACHE_TYPE=q8_0`,                  │                          │                                                                                                    │
+│ `use_mmap=false`, `--spec 6`)                  │                          │                                                                                                    │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ DFlash2 drafter                                │ not adopted 11-05        │ MTP wins the upstream head-to-heads; DFlash2 is a separate 1.2 GB draft model and Qwen-only        │
+├────────────────────────────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ INT8 compute conversions                       │ dead end 10-14 (ISA      │ on this chip INT8 runs at quarter rate = same as FP32; packed FP16 is the only 2x path             │
+│                                                │ survey)                  │                                                                                                    │
+└────────────────────────────────────────────────┴──────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+---
+
+## 5. Speed record
+
+### 5.1 How to read the tables
+
+Reading speed (PP) is the trustworthy column; writing speed (TG) has the ±3–4% noise described in §1.
+Every number is the middle of ≥3 counted passes after a discarded warm-up.
+
+### 5.2 The story so far, in order
+
+**⚠ One caveat before the table:** every row dated before 2026-10-19 was measured with the slow
+one-token-at-a-time expert batching (a leftover workaround from the Ollama fork days). On 10-19 we
+flipped it off (`STRATA_PLE_BATCH=1`) and reading speed jumped 12–14% from that alone. So the
+pre-10-19 rows are not directly comparable to the later ones — the jump you see across that line is
+mostly the batch flip, not the other changes listed.
+
+┌────────┬──────────────────────────────────────────────────────────────┬───────────────┬───────────────┬───────────────┬───────────────┐
+│ Date   │ What this row is, in words                                   │ 16K           │ 32K           │ 64K           │ 128K          │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-12  │ Ollama 0.34.2, Q4_K_M weights (the starting point)           │ 168.3/15.3    │ 171.3/14.8    │ 160.5/14.1    │ 140.4/11.4    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-13  │ Ollama 0.40.3, same weights                                  │ 188.4/16.2    │ 185.5/17.1    │ 172.6/15.9    │ 149.8/15.2    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-13  │ First Strata build (the upstream fork), same weights - 2-4x  │ 290.7/45.3    │ 288.8/47.4    │ 286.0/48.9    │ 280.3/46.4    │
+│        │ Ollama                                                       │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-14  │ Strata 0.1.43 self-built, Q4_K_M                             │ 527.7/51.1    │ 540.5/49.1    │ 536.9/50.8    │ 516.3/49.6    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-15  │ Same, weights switched to IQ3_S (3.1-bit)                    │ 793.1/65.1    │ 807.6/68.9    │ 789.3/68.2    │ 737.9/67.8    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-16  │ Same, coder 1-bit variant (dropped same day)                 │ 870.8/81.1    │ 863.7/78.2    │ 837.1/72.4    │ 775.6/69.6    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-14  │ 0.1.44.1 + ROCm table + SIMT1 scorer, IQ3_S                  │ 823.0/73.9    │ 834.0/76.8    │ 834.7/76.5    │ 822.6/72.9    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-14  │ + the wave-reduce kernel fix                                 │ 828.8/72.7    │ 841.6/75.5    │ 842.3/74.0    │ 827.5/74.2    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-15  │ 0.1.44.1, Unsloth 4-bit lane + 5-token drafting              │ 835.5/73.2    │ 857.8/73.7    │ 869.4/73.3    │ 861.0/70.0    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-25  │ Generation 1: 0.1.48.1 + F-2, benchmark parking (the         │ 923.2/92.2    │ 944.9/91.5    │ 953.8/88.7    │ 943.8/86.2    │
+│        │ reference row)                                               │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 10-29  │ 0.1.53 new main, without / with F-2 (first A/B round)        │ 902.5 / 912.3 │ 943.5 / 957.5 │ 946.8 / 962.1 │ 933.5 / 949.0 │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-01  │ 0.1.55, without / with F-2 (second round, med-of-6) -> F-2   │ 910.9 / 927.3 │ 931.9 / 948.5 │ 940.1 / 957.2 │ 931.1 / 947.7 │
+│        │ wins, promoted                                               │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-03  │ Same binary with the SIMT2 scorer (retired this day)         │ 918.7/91.0    │ 932.0/88.2    │ 914.4/87.2    │ 858.2/86.3    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-03  │ Generation 2: 0.1.55 + F-2 + CPU offload + persistent hc     │ 944.6/94.6    │ 957.9/94.5    │ 961.9/93.0    │ 951.4/89.3    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-04  │ Generation 3: same + patched expert kernels                  │ 956.8/92.6    │ 973.3/95.6    │ 973.5/92.9    │ 960.2/89.2    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-05  │ Generation 4 - current daily: Strata 0.2.10 + F-2 + patched  │ 966.2/90.4    │ 986.0/90.7    │ 982.3/94.0    │ 965.8/89.4    │
+│        │ kernels                                                      │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-18  │ Generation 5 - current daily: 0.2.15-dev + F-2 +             │ 995.7/96.9    │ 1008.7/94.1   │ 1013.5/94.0   │ 1002.9/90.9   │
+│        │ patched kernels (three-arm A/B, med-of-3)                    │               │               │               │               │
+│ 11-19  │ 0.2.16 tip (engine 0.1.62) vanilla - no F-2, no MMQ (the MMQ │ 980.0/95.7    │ 985.3/95.9    │ 991.9/93.6    │ 973.5/89.9    │
+│        │ build path was removed upstream; 6.35; med-of-6, two rounds) │               │               │               │               │
+│ 11-19  │ Same base + F-2 (clean cherry-pick onto the tip) - med-of-3, │ 998.2/95.0    │ 1004.2/93.1   │ 1010.0/92.2   │ 990.9/91.2    │
+│        │ one round, ran second and warmest (bias would understate it) │               │               │               │               │
+│ 11-19  │ Same base + F-2 + GDN quad path (STRATA_GDN_HEAD=1           │ 1049.1/92.1   │ 1046.0/92.3   │ 1044.2/94.3   │ 1027.1/89.5   │
+│        │ STRATA_GDN_PP=2, env-only; gdn recurrence -51%; see §6.36)   │               │               │               │               │
+│ 11-19  │ Same base + F-2 + GDN quad path - med-of-3 (both arms same   │ 1023.0/96.1   │ 1024.3/96.7   │ 1036.0/94.1   │ 1024.0/89.1   │
+│        │ evening, baseline last and warmest; promoted; see §6.36)     │               │               │               │               │
+│ 11-19  │ Same + STRATA_GDN_OUTNORM=0 (F-3: old out-norm launch) -     │ 1007.5/94.7   │ 1014.1/94.2   │ 1022.4/91.8   │ 1002.4/91.3   │
+│        │ REJECTED, med-of-3 loses every tier; patch reverted; §6.37   │               │               │               │               │
+│ 11-23  │ Gen-5 stack re-run (arm A, second three-arm)                 │ 998.5/98.0    │ 1012.5/93.2   │ 1016.6/94.5   │ 1005.2/92.2   │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-23  │ 0.2.20-dev vanilla - upstream deleted the MMQ path (6.38)    │ 990.2/99.3    │ 988.1/100.1   │ 997.3/96.9    │ 979.7/93.1    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-23  │ 0.2.20-dev + F-2 (80e4a0a48): F-2 worth +1.0-2.2%            │ 1009.1/100.7  │ 1010.0/96.8   │ 1007.1/95.7   │ 997.0/93.4    │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1054.4/100.6  │ 1051.9/99.1   │ 1048.4/94.7   │ 1037.8/93.7   │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-4.5%           │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+└────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
+
+### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
+
+On this GPU, writing speed tracks how many expert bytes each token touches — the 1-bit set wins
+monotonically. The 1-bit lane was the first time this box broke 1,000 reading and 100 writing.
+
+┌──────────────────────────────────────────────┬───────────────┬───────────────┬───────────────┬───────────────┬────────────────────────────┐
+│ Lane (disk size, bits/weight)                │ 16K           │ 32K           │ 64K           │ 128K          │ Status                     │
+├──────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┼────────────────────────────┤
+│ IQ3_S - the usual daily weights (78 GB, ~3.1 │ 966.2/90.4    │ 986.0/90.7    │ 982.3/94.0    │ 965.8/89.4    │ daily                      │
+│ bits/weight)                                 │               │               │               │               │                            │
+├──────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┼────────────────────────────┤
+│ UD-IQ2_XS - Unsloth 2.5-bit (78 GB)          │ 979.7/96.0    │ 984.5/96.6    │ 980.6/94.3    │ 964.6/93.0    │ parked                     │
+├──────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┼────────────────────────────┤
+│ UD-IQ1_M - Unsloth 1-bit (68 GB)             │ 1000.6/100.9  │ 1004.4/98.1   │ 999.7/97.6    │ 982.2/92.1    │ trial ended 11-18 -        │
+│                                              │               │               │               │               │ back on IQ3_S (gen 5)      │
+├──────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┼────────────────────────────┤
+│ DeepSeek-V4.1-Flash 2.5-bit (deleted 11-06)  │ 209.4/19.2    │ 231.7/19.2    │ -             │ -             │ 64k+ context needs more    │
+│                                              │               │               │               │               │ VRAM than one card         │
+└──────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┴────────────────────────────┘
+
+Accuracy side (Unsloth's published ladder, not our measurement): the 1-bit set recovers ~79.7% of
+full-precision top-1 answers (KLD 0.315); the 2.5-bit set has **no** published number; 3-bit-class
+sets ≈ 85%+. One caveat on the 2.5-bit lane: its biggest expert layer is stored Q5_0 and that kernel
+computed at 2.6–3.0% dot-product error on 0.2.10 (0.2.11 fixes it to ~1.2%). The 1-bit set has no
+such layer.
+
+### 5.4 Best numbers ever, and things worth remembering
+
+- Best reading speed per tier: 1000.6 (the 1-bit lane, 11-06) / 1008.7 / 1013.5 / 1002.9 (the last
+  three from generation 5, 11-18). Best writing: 100.9 / 98.1 / 97.6 / 93.0 (the 1-bit lane, 11-06).
+- The "0.1.48 lost 16k" scare (10-24/25) was the conversation cache being evicted between tiers, not a
+  code regression. The attempted bisect died of single-boot noise (±1.3% > the effect) — always interleave.
+- 0.1.48.1's prefill regression vs 0.1.47 was bounded to ≤16k context, −2.4% calibrated (10-24); never
+  bisected (low value).
+- The 128k KV-compaction cycle went 16.4 min → 3.0 min across the record (5.5×).
+
+---
+
+## 6. Every experiment: what it was, what happened, how to redo it
+
+Format per entry: **What we tried → what happened → verdict → how to redo it.** "Old doc" = the
+pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
+
+1. **Ollama → Strata move** (10-12/13). Tried the incumbent Ollama 0.34/0.40 against the first Strata
+   build on the same weights. Result: Strata was 2–4× faster on every tier. Verdict: migration done.
+   Redo: Ollama configs via `bench_ollama_tiers.py`; Strata via the v043 configs (old doc).
+2. **ROCm tuning table (upstream PR #1167)** (10-14). Shipped a V620-tuned rocBLAS table.
+   +1.2–2.7% reading speed. Adopted. Redo: env `STRATA_ROCBLAS_TUNING` pointing at
+   `tools/hip/gfx1030-rocblas-5.6.0.8d1ae90e.txt` (shipped; the loader silently rejects tables whose
+   version doesn't match — a system rocBLAS 5.1.1 table was rejected). Re-tune command:
+   `cmake --build build-hip --target tune_rocblas && LD_LIBRARY_PATH=/opt/rocm/lib ./build-hip/tune_rocblas --tuning-out <out>.txt`. A/B configs: `strata-iq3_s-pr1167{,-noTable}.json` (old doc).
+3. **SIMT1 scorer (upstream PR #1151)** (10-14). The author claimed +3.2%; on our single card it gave
+   +8.6% reading at 128k. Adopted. Redo: env `STRATA_SELECT_SIMT=1`; the log line
+   `qsa select: FP32 tiled scorer` confirms it took effect.
+4. **DPP wave-reduce kernel fix** (10-14, commit `48d6aa11`). +0.3–1.0% reading, bit-identical.
+   Adopted, now upstream. Redo: old doc "wave-reduce A/B" + result JSONs `…20261014_08*`.
+5. **fused_gr/gr kernel extension** (10-14). Tried converting 19 call sites to DPP form: 17 converted
+   bit-identically, 2 ternary sites in `fused_gr.cu` produce hash diffs with an unpinned cause.
+   Abandoned. Revisit only with a hot-path profile AND an ISA diff of those two kernels. Old doc bisect section.
+6. **rocBLAS self-tune on this card** (10-14). The shipped table was tuned on a 6900 XT; a V620
+   self-tune picks different kernels for 56/112 shapes, but tier deltas were ±0.2% = noise. Kept the
+   shipped table (portability datapoint). Redo: `tune_rocblas` command above; protocol = ≥3 soak
+   passes per arm, med-of-3.
+7. **Power/thermal study** (10-14). The ~180 W cap governs clocks; a cold machine reads up to 5%
+   faster at 16k (2% at 64/128k) than a settled one. Knowledge → became the soak rule (§3.1).
+   `setperfdeterminism` unsupported on this card.
+8. **RDNA2 ISA survey** (10-14). Checked what the chip can actually do: INT8 runs at quarter rate
+   (= FP32 parity, useless), packed FP16 (`v_pk_fma_f16`) is the only 2× path, no WMMA/MFMA on
+   gfx1030; the dp4a shim routes correctly. Knowledge — this is what later justified the MMQ/VOP3P work.
+9. **Unsloth 4-bit lane** (10-15). Reading +3–4% but writing −8–12% vs IQ3_S (the bigger weights cost
+   memory bandwidth). Lane deleted 11-03. Redo: unsloth GGUF + `iq_pack.py --compat-bf16`, config
+   clone with `--vram-reserve-mib 600`.
+10. **5-token drafting A/B** (10-15). Writing +6.2–8.5%, reading flat; no acceptance decay at long
+    context on prose. Adopted (`--spec 5 --mtp-window 8192`). Acceptance is only visible in the serve log.
+11. **Halo ladder replication** (10-16). The Halo report's 128k acceptance collapse did NOT reproduce
+    here (0.79–0.85 acceptance at 128k). Machine-specific upstream finding. Redo:
+    `~/git/llm-benchmark/halo_ladder.py`, data `halo_ladder_runs.json`.
+12. **Needle recall test** (10-16). 15/15 correct recall on both lanes tested (4-bit + 5-token, and
+    IQ3_S + 4-token). This is our standing quality gate. Redo: `~/git/llm-benchmark/halo_needle.py`
+    (parametrize per lane; needs `STRATA_API_KEY`).
+13. **Six-lane keep/drop matrix** (10-16). Benchmarked six quantizations in one session. IQ3_XXS had
+    the best writing speed; Q4_K_XL ran ~60% slower (k-quant dead end confirmed at scale). At the time
+    we kept 4-bit/IQ3_XXS/abliterated and dropped the rest — note IQ3_S came back as the standard lane
+    on 10-18, and the other lanes were deleted 11-03. Redo: `run_matrix.py` + configs `*-spec5.json` (old doc).
+14. **huihui abliterated-v2** (10-18). Performance parity with the base lane; a byte-level diff proved
+    the model card wrong — the expert down-projections ARE ablated in 43/48 layers. Recall 15/15,
+    refusal probe 0/6. Lane deleted 11-03.
+15. **Rebase + branch A/B matrix** (10-18/19). Rebased all local gfx1030 work onto upstream `477ac13c`;
+    the +13% decode vs the fork is the fork default + wave-reduce; reading speed parity across arms.
+    Redo: `tools/ab_engine.py --rounds 3`.
+16. **Batched expert reading (PLE flip)** (10-19). Turned off a stale one-token-at-a-time workaround
+    (upstream issue #541; no fix upstream, but zero stalls here since the 0.1.4x prefill rewrite).
+    +10.8% reading at 33k probe, +11.6–14% on tiers, writing +2–6%. Adopted. If a stall ever
+    reappears: set `STRATA_PF_STEP_SYNC=1` to diagnose; revert to `STRATA_PLE_BATCH=0` as last resort.
+    The baseline caveat is §5.2.
+17. **qsa-attention deep-dive (the "S-series")** (10-18/19). Profiled the attention scorer: it is
+    instruction-issue-limited at ~23% of FP32 peak. Two attempted fixes both lost in the engine (fixed
+    per-block overhead — micro-benchmarks do not transfer to small blocks). Opt-in flags remain in the
+    tree, off by default. Redo: `tests/hip/qsa_rows_bench.cpp` + `tests/hip/dot_score_bench.cpp`
+    (stop the server first — the benches need 30–150 MB VRAM).
+18. **hc-chain analysis (S27–S29)** (10-19). Found the attention-mix path does a GEMM (6.03 ms/launch
+    at 77% of packed peak via rocBLAS) and a wasteful widen step. Porting the GEMM was dead; skipping
+    the widen was the prize → became F-2 (next entry). Redo: `tests/hip/upmix_gemm_bench.cpp`;
+    `tools/hip/tune_rocblas` over engine shapes (all `keep_default`).
+19. **F-2 skip-widen** (10-20 → promoted 10-24). Skip the float16-widen step in the attention-mix path:
+    −1042 ms / −3.2% GPU timeline at T=32005, output bit-identical (parity: `tests/hip/mix_h16_parity.cu`,
+    21 shapes + the in-server check). Reconciliation note: the per-phase timers sum to −2242 ms because
+    they double-count cross-stream overlap (~4.6 s baseline over-count) — the difference is fully
+    explained, there is no missing time. Adopted; committed as `392586db` lineage and cherry-picked
+    onto every later base. Redo A/B: `STRATA_HC_MIX_H16=0/1` on the same binary.
+20. **Calibration** (10-22 on 0.1.47; re-verified 10-24 on 0.1.48.1+F-2). Recipe: pcie-frac 0.00,
+    spec-min-p 0.70, SH_STREAM=1. Run via `./setup.sh --calibrate` → `tools/calibrate.py` (686 s).
+    Warning: never run it while the daily server is live (it restarts the model repeatedly).
+    `strata launch --tune quick|thorough` is the Terminal equivalent (never used here).
+21. **Draft-vocabulary recipe (T9)** (10-23). Point the 5-token draft head at a smaller English-only
+    vocabulary: chat writing +5.2%, agent writing +6.8%, zero reading cost. Adopted. Rejected in the
+    same sweep: spec 4, adapt-overlap, pcie-frac 0.35, T7+T9 combo, vram-reserve 200 on agent,
+    no mtp-window. Redo: `--mtp-draft-vocab /home/drewster/git/Strata-main/data/draft_vocab_en.bin`.
+22. **PR-A (making SH_STREAM a default)** (10-23/24). Reading −2.3–2.5% on the 0.1.47 base — opposite
+    sign vs the same flag on 0.1.44.1. Dropped; upstream later shipped per-PC calibration (#1992)
+    instead. Lesson: a flag's effect does not carry across base versions.
+23. **Conversation-cache parking discovery** (10-25). A big session's cache eviction costs ~1 s on the
+    next request; parking ON for daily use, OFF for benchmarks (§1). Redo: the `/tmp/probe-nopark.sh`
+    and `/tmp/agent-loop.py` patterns (old doc).
+24. **New-main A/Bs, rounds 1–2** (10-29, 11-01). Interleaved, parking-off. F-2 won the med-of-6
+    (6/6 sweep) → the 0.1.55+F-2 binary was promoted (generation 2's binary). The missing
+    `--engine strata` server gotcha was found here (§3.1.5).
+25. **SIMT1 vs SIMT2 scorer** (11-03). SIMT2 loses reading speed on every tier and gets worse with
+    context; the 128k row was identical across boot orders (so not thermal). Retired; SIMT1 stays.
+26. **Six-knob screen** (11-03). One boot per candidate, soak + 2 counted passes. Adopted: CPU offload
+    + persistent hc (generation 2's config). Retired: rocBLAS retune, `STRATA_DENSE_MMQ`,
+    `STRATA_TOPK_STREAM=0`. Redo: the `/tmp/env_screen.py` pattern.
+27. **Environment-variable screens** (11-03/04). `STRATA_IO_THREADS`, `STRATA_PIPED_CONCURRENT`,
+    `STRATA_PREFILL_STREAM_MIN`: positive on synthetic text, negative on real text → retired. This is
+    the origin of the E483 real-text rule (§3.2).
+28. **Patched expert kernels (MMQ/VOP3P)** (11-04). Patches 6+7 on llama.cpp pin `3cf03257f` (+ helper
+    commit `56ccab041`); the iq3_s kernel went 30.9→31.7 TFLOPS author-side; here reading +0.9–1.4% on
+    every tier, writing a wash. Adopted (generation 3). Redo: llama.cpp branch `v620-mmq-vop3p` +
+    `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` pointing at it.
+29. **Strata 0.2.10 stack (generation 4)** (11-05). 0.2.10 + F-2 (clean cherry-pick `434dfe91`) +
+    patched kernels: reading +0.4% vs generation 3 across 8/8 interleaved pairs; captures upstream's
+    own +2–3% improvements. Adopted. Redo: branch `v620-gfx1030-tuned` at commit `434dfe91` + the build
+    flags (§3.1.1).
+30. **DFlash2 vs MTP drafter** (11-05). DFlash2 is a separate 1.2 GB drafter, Qwen-only; upstream
+    head-to-heads favor MTP. Kept MTP. Redo: `--draft dflash2 --draft-model PACK` on 0.1.55+.
+31. **DeepSeek-V4.1-Flash at 2.5-bit** (11-06). First gfx1030 run of this model anywhere: reading
+    209–231 (ties the best documented single card) but writing 19.2 (it is a reasoning model, and its
+    KV needs ~0.29 MB/token so 64k+ context cannot fit one card). Curiosity lane only; deleted 11-06
+    at the user's request. Redo: the `dsv41` engine via config `"exe": strata-dsv41`,
+    `-DSTRATA_BUILD_DSV41=ON`; pack recipe in the old doc.
+32. **Unsloth 2.5-bit and 1-bit lanes** (11-06). Results in §5.3. Redo: configs
+    `/tmp/ud-iq{2xs,1m}.json`, packs `packs/{iq2xs,iq1m}`; set `HF_HUB_DISABLE_XET=1` for fast downloads.
+33. **Strata 0.2.11 review** (11-06). Read the release: no gfx1030-relevant changes (all new speed work
+    is gated to NVIDIA, gfx12, or the split-engine path); llama.cpp pin unchanged; F-2 cherry-picks
+    clean; server.py fixes worth having (streamed tool-args, branch races, 60 s no-progress disconnect).
+    Also noted: the Unsloth sets were re-uploaded (v3.1) and 0.2.11 fixes the Q5_0 dot error (§5.3
+    caveat). Rebase decision still open (§8.2).
+34. **New main pulled: three-arm A/B (generation 5)** (11-18). Pulled upstream: 1,261 commits to
+    0.2.15-dev (`c77572806`, engine 0.1.60). Structure change: the ggml is now vendored
+    (`third_party/strata-ggml`, commit `745819efc`), overridable with `-DSTRATA_GGML_DIR` — the
+    FETCHCONTENT pin is gone, and the MMQ options split (`STRATA_MMQ` is new and default off;
+    `STRATA_PREFILL_MMQ` now requires it). Arms, one boot each, soak + 3 counted passes, order A,B,C:
+    A = generation 4's binary, B = vanilla new main (`wt-0215`), C = new main + F-2 cherry-pick
+    (`749cfbb18`) + the 3 MMQ patches committed into the vendored tree (`b638c7ac2`). Reading speed,
+    med-of-3: B beat A by +1.2-1.3% at every tier (upstream's own gain); C beat B by +1.9-2.0% (our
+    changes still add on top); C beat A by +3.2-3.3%. Writing speed a wash (noise band). C promoted
+    (generation 5); new IQ3_S-lane records at 32k/64k/128k. Limits: one boot cycle, no reversed
+    round - but C ran last and warmest, so any thermal bias would understate C, not inflate it.
+    Redo: clone the daily config per arm (exe -> that arm's binary, add `--conversation-cache-mib 0`),
+    boot each, soak + 3 passes. Arm C build flags: `-DSTRATA_MMQ=ON -DSTRATA_PREFILL_MMQ=ON
+    -DSTRATA_MMQ_KQUANTS=OFF -DSTRATA_Q6K_EXPERTS=OFF -DSTRATA_MMQ_TQ_OVERLAY=OFF`.
+35. **0.2.16 pull: vanilla vs vanilla + F-2** (11-19). Upstream moved 728 commits (tip `58ee32277` = the v0.2.16
+    tag + 4 doc/docker commits; engine 0.1.62). Two structural changes: the layout moved (`engine/`,
+    `terminal/`, `app/`, `docs/` — the server is now `terminal/serve/server.py` and cmake configures with
+    `-S engine`), and "own-stack step 10" deleted llama.cpp's MMQ path and the vendored ggml's ggml-cuda, so
+    the MMQ/VOP3P patches have nothing to patch and `STRATA_MMQ`/`STRATA_PREFILL_MMQ` are gone (`STRATA_PREFILL_MMQ`
+    is now an Intel int8-expert switch). gfx1030 stays supported. Arms, one boot each, soak + 3 counted passes,
+    parking off, order vanilla → F-2, then a reversed vanilla round (vanilla = med-of-6): reading speed med
+    980.0/985.3/991.9/973.5 (vanilla) vs 998.2/1004.2/1010.0/990.9 (F-2) — **F-2 wins every tier by +1.8–1.9%**
+    (PP noise floor ±0.3%); writing a wash. The F-2 cherry-pick onto the tip conflicted only on the test file
+    (moved to `engine/tests/hip/`) and compiled with no manual fixes (commit `f786675dc`); the in-server
+    `STRATA_HC_UPMIX_CHECK` reports `mixed rel RMS 0.000e+00, max |diff| 0.000e+00` at both checked layers
+    (T=8154) — the port is bit-exact where it acts. Limits: no reversed F-2 round (its med-of-3 ran second,
+    warmest — the bias would understate it); halo_needle recall not run (the changed path is proven bit-exact
+    instead). Cross-session vs the generation-5 row (11-18): +0.25% at 16k, −0.45% / −0.35% / −1.19% at
+    32k/64k/128k — a generation-6 promotion is undecided (§8). Side findings: greedy decode is not reproducible
+    run-to-run within one boot on generation 5 AND on 0.2.16 (§3.3, root cause open); record correction — the
+    generation-5 `build-hip` cache points `STRATA_GGML_DIR` at `~/git/llamacpp-mmq`, so the promoted binary was
+    built from that checkout rather than purely from the in-tree vendored patches (both carry the same VOP3P
+    work; the measured numbers stand). Redo: worktrees `~/git/wt-0216` (branch `v620-0216-vanilla`) and
+    `~/git/wt-0216-f2` (branch `v620-0216-f2`); configs `~/strata-v620-iq3_s-T9-0216-{vanilla,f2}.json`
+    (parking off); build flags `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030
+    -DCMAKE_BUILD_TYPE=Release` with `cmake -S engine`; result JSONs
+    `strata_tier_pass_20261119_06*.json`…`_07*.json`.
+
+---
+
+## 7. If a second V620 arrives
+
+Layer split is the expected win for reading speed (not helper mode — a helper-card experiment upstream
+lost ≥1.5k tokens/s on PCIe 4.0). Evidence from other people's boxes, none measured here yet:
+a 2×V620 report (`bench/results/2x-v620.txt`, untracked) shows 4k/16k reading 893.4/1,380.3 and writing
+68.1/70.7; a 0.1.41 2×6900 XT report shows split ≈ +50% mid-tier reading and +32–39% writing; GitHub
+issue #3930 (2×2080 Ti) shows writing 35.2→51.0 with the decode-timing window 70→38 ms.
+
+1. Stop the daily server. In the config: `"gpu": [0,1]`, `"layer_split": "auto"`. Boot and WATCH the
+   log's split lines (which layers went to which card).
+2. Benchmark with parking off, compare against the generation-4 row (§5.2). Sanity check: if reading
+   speed is flat from 4k to 16k, the second card is idle — stop and debug before continuing.
+3. Then, one change at a time: `--pipeline-windows 2`, env `STRATA_SPLIT_OVERLAP=1`, and a fresh
+   calibration run (never while serving the daily server). Re-check `STRATA_HC_PERSIST` — its
+   author-side gains were measured on a split config.
+4. DeepSeek-V4.1 is natively multi-GPU (a 2-card boot collapses `tensor parallel 2 -> 1`); 128k context
+   fits two cards only without the drafter. The DSpark economics also flip at two cards (the drafter
+   fits; ~18% expert-cache coverage).
+
+---
+
+## 8. Things still open
+
+1. **Second V620** — runbook above (§7); this TODO closes when the card arrives.
+2. **0.2.11 rebase** — closed 11-18: superseded. We jumped straight to 0.2.15-dev and promoted it
+   (generation 5, §6.34).
+3. **#3381 RDNA2 prompt-attention port** — the diff at `~/strata-upstream/pr-3381-prompt-attn-rdna2.diff`
+   (373 lines) does NOT apply to 0.1.55 or 0.2.10 (drift at `prefill.cpp:3435`); needs a manual port.
+   Author claims the QSA prompt chunk gets 29% faster.
+4. **Memory-lock (memlock) raise** — needs interactive sudo; the PLE table mlock fails at 8 MiB (§2.1).
+5. **Upstream write-ups** — two drafts sit in `~/strata-upstream/` (rocBLAS-retune-neutral,
+   simt2-vs-simt1); PR descriptions pending for the three pushed fork branches.
+6. **1-bit trial verdict** — closed 11-18: the trial ended when generation 5 was promoted; the box is
+   back on IQ3_S. The lane can be recreated from §6.32 if wanted (its /tmp configs are gone).
+7. **Decode-timing boot** — one benchmark boot with `STRATA_DECODE_TIMING=1` is still the candidate
+   way to attribute split-config writing speed (see §7 and GitHub issue #3930).
+8. **Greedy decode reproducibility** — identical temperature-0 requests give different text within one boot
+   (generation 5 and 0.2.16 both; seed pinning, drafting off and CPU offload off each ruled out, §6.35).
+   Root cause wanted; until then the §3.3 byte-identical smoke stays retired in favor of the in-server check.
+9. **Generation-6 decision** — closed 11-23: the wanted same-day round ran (generation-5 binary as
+   arm A vs 0.2.20-dev arms, §6.38). Parity on PP without GDN, and with the GDN env the new base wins
+   every tier by +4.1–4.5%; promoted as generation 6.
+
+---
+
+## 9. Where everything lives
+
+- **Worktrees**: `~/git/Strata` (main checkout, 0.2.15-dev, commit `c77572806`) and `~/git/v620-gfx1030-tuned`
+  (the daily build and this document's home; branch `v620-gfx1030-tuned`). The experiment worktrees
+- **0.2.16 worktrees** (11-19): `~/git/wt-0216` (vanilla tip, branch `v620-0216-vanilla`) and `~/git/wt-0216-f2`
+  (tip + F-2 as commit `f786675dc`, branch `v620-0216-f2`); arm configs
+  `~/strata-v620-iq3_s-T9-0216-{vanilla,f2}.json`; arm logs `~/engines/logs/arm-0216-*.log`.
+  (`Strata-main`, `wt-0155`, `wt-0215`, `wt-bisect`, `wt-f2-0147`, `wt-f2-0148`, `wt-mmq`) were
+  removed on 11-18 (branches kept, on the fork); `wt-0215-f2` followed the same day, after generation
+  5 was merged into `v620-gfx1030-tuned` and rebuilt there. The branch used to be called
+  `v620-stack-0210-f2-mmq` — renamed on 11-18, and on 11-23 it became the archive
+  `v620-0215-f2-mmq` (generation 5) while `v620-0220-f2` took the daily name `v620-gfx1030-tuned`
+  as generation 6.
+- **GitHub forks** (backup copies): `andrewprock/Strata` — branches `v620-daily-0155-f2` (generation 3),
+  `v620-gfx1030-tuned` (generation 6 plus this record), `v620-0215-f2-mmq` (generation 5, archived 11-23),
+  `v620-0215-f2` (generation 5 pre-merge), plus
+  the experiment branches
+  `f2-0147`, `f2-0148` and `parked/pr-a-gfx103x-default`; `andrewprock/llama.cpp` —
+  branch `v620-mmq-vop3p` (the patched kernels, for the pre-vendored bases). The `gh` CLI is
+  authenticated (https).
+- **Configs**: daily `~/strata-v620-iq3_s-T9-v6.json` (generation 6); previous daily `...-v5.json`
+  (generation 5), `~/strata-v620-iq3_s-T9-draftvocab.json` (generations 2-4), and the 11-19
+  0.2.16 experiment family `~/strata-v620-iq3_s-T9-0216-*.json` (kept as the GDN record).
+  Warning: /tmp configs
+  (Unsloth lanes, bench arms) are wiped on reboot — 11-18 lost all of them; recreate from the §6
+  recipes when needed.
+- **Model packs**: `~/git/Strata-data/packs/{iq3_s,iq1m,iq2xs,iq3_s-abl}`; the MTP draft head at
+  `~/git/Strata-data/mtp/rt`.
+- **Benchmark results**: `~/git/llm-benchmark/results/strata_tier_pass_*.json` (the timestamp in the
+  filename is the run time).
+- **Binary backups**: `~/engines/backup/{strata-0.1.47-base, strata-0.1.48.1-f2, strata-0.1.55-f2,`
+  `strata-0.1.55-f2-mmq, strata-0.2.15-dev-f2-mmq}` (generations 1-3 and 5). Generation 4's binary was
+  not kept; rebuild it from commit `434dfe91` with the §3.1.1 flags if ever needed. The daily
+  generation-6 build lives in `~/git/v620-gfx1030-tuned/build-hip`.
+  This document's earlier versions: `~/strata-migration.md.bak-20261117-pre-rewrite` and
+  `~/strata-migration.md.bak-20261117-post-redundancy`, plus git history (`c8d3f3b2` original →
+  `ba97795e` dedup → `08de0232` first rewrite → this one).
+- **The 9 environment variables that every lane config carries** (what each does):
+  `STRATA_WATCHDOG_S=300` (restart watchdog timer), `STRATA_PLE_BATCH=1` (batched expert reading),
+  `STRATA_HIP_PROMPT_F16=1` (FP16 prompt path), `STRATA_SELECT_SIMT=1` (the fast scorer),
+  `STRATA_SH_STREAM=1` (streamed short-context path), `STRATA_ROCBLAS_TUNING=<abs path>` (the tuning
+  table), `STRATA_HC_MIX_H16=1` (F-2 skip-widen), `STRATA_PREFILL_CPU_SHARE=1` (CPU offload),
+  `STRATA_HC_PERSIST=1` (persistent hc state).
+
+---
+
+## 10. The inner loops on 0.2.16 (gfx1030 map, 11-19)
+
+Where the hot code actually lives after upstream replaced the llama.cpp MMQ prompt path ("own-stack
+step 10", §6.35). Constraint first: **RDNA2 has no matrix cores.** Every WMMA kernel in the tree
+(Aurora experts, the GDN chunked scan, the upmix WMMA path) is `__gfx11xx__`/`__gfx12xx__` guarded —
+gfx1030 has one accelerant, the byte dot `v_dot4_i32_i8` (dp4a), plus packed-FP16 VOP3P ALU ops.
+Notable: upstream already absorbed our dp4a lesson — `i8_expert.cuh:27` documents starting a chain's
+byte dot with three-operand `v_dot4_i32_i8` (src2 = 0) on gfx1030-1032 instead of the `v_mov 0` +
+`v_dot4c` pair the compiler emits. That was the core of our llamacpp-mmq patches; the idea survives,
+the patches do not (they are stranded on the pre-0.2.16 stack, §6.35).
+
+The five loops that matter, in priority order for this card:
+
+1. **MoE expert tile GEMM, prefill** (`engine/src/kernels/cuda/i8_expert.cuh`, `i8_kernel<T, GU>`;
+   default-on for gfx1030 in this build — the daily config sets no `STRATA_EXPERT_I8`). A block owns
+   64 weight rows × 16 token entries, walks K in 128-value stages; each thread decodes one 32-value
+   sub-block into int8 in shared memory **once per tile** (not per 4 rows — that is what separates it
+   from the `native_expert_grouped` few-rows route, which is chosen only when a layer's groups average
+   under ~7 rows per expert, never at our prompt sizes). Then 8 dp4a + integer scale algebra + one
+   float FMA per 32 values, exact integer arithmetic. RDNA2 polish already in: first-dot src2=0,
+   16-byte scale records with `mul24/mad24`, sign via a 256-entry XOR-mask table, LDS rows padded to
+   36 dwords, `I8_BLK_UNROLL=1` because full unroll spills 55–200 VGPRs on gfx1031. Measured
+   1.10–1.35× over MMQ on an RX 6700 XT (upstream's number, not ours). **The main research target:**
+   tile shape and VGPR budget were tuned on a 6700 XT, not a 72-CU V620.
+2. **Dense projection GEMMs, prefill** (`engine/src/prefill/gemm.cu` → rocBLAS/hipBLASLt). On gfx1030
+   rocBLAS only ships tuned kernels for FP16→FP16, int8 and FP32→FP32, so `prompt_f16()` routes
+   prompt GEMMs FP16-in/FP32-accumulate — default-on for gfx103x now (measured 11–14% faster
+   upstream). This is the loop F-2 attacks (skip-widen, `STRATA_HC_MIX_H16=1`, +1.8–1.9% §6.35).
+   Remaining levers: the opt-in own SGEMM (`STRATA_RDNA2_SGEMM=1`, author-side 343→534 tok/s on an
+   RX 6800, not bit-identical, not default) and the rocBLAS tuning table. Mostly harvested.
+3. **Expert GEMV + PLE, decode** (`native_mmvq.cu` `iq_mmvq`, transcribed from llama.cpp mmvq;
+   `ple.cu` single-token BF16/F32 MMVF, `STRATA_PLE_BATCH=1`). Decode is bandwidth-bound: 12,333
+   experts cached in 23.4 GiB VRAM, the rest streamed from the 46.8 GiB locked-RAM pool. Instruction
+   choice inside the dot barely matters here; cache hit rate, PCIe and PLE batching decide TG.
+4. **GDN linear-attention recurrence** (`native_gdn.cu` adapted from llama.cpp's gated_delta_net;
+   `fused_gdn.cu`, `gdn.cu`). gfx1030 runs the direct scalar form — the chunked WMMA/WY scan is
+   gfx11+ only. Warp owns a (head, column) state in registers; latency-shaped, a fixed per-layer
+   cost on PP and part of the per-token critical path on TG.
+5. **Attention + hyper-connection GEMVs** (`qsa*.cu`, `gr.cu`, `kv_q8.cu`/`kv_q4.cu`). Pure SIMT;
+   `gr.cu`'s warp-per-row lesson is documented in its header (the first version launched one block
+   and cost 262 ms/token). QSA keeps scores in shared memory and picks top-k by binary-lifting
+   threshold search.
+
+Measured phase shares (11-19, `STRATA_PREFILL_TIMING=1`, F-2 worktree build, one tier pass;
+shares of the GPU timeline, stable across 16k/32k/64k/128k):
+
+- **Expert GEMM ("gemm gate/up") 26–28%** — biggest single phase, stable across tiers (26.7% @16k,
+  27.9% @32k, 26.8% @64k, 26.0% @128k). A 10% kernel win here is only ~2.5–3% overall PP.
+- **GDN family 28–29%** (`gdn` 14% + `gdn recurrence` 7.6→9.1% + `gdn out proj` 4.4–4.8% +
+  `gdn conv+gates` 1.2%) — as large as the experts, and on gfx1030 it runs the non-WMMA scalar path.
+  Now the most interesting research target, arguably ahead of the experts.
+- **QSA attention family ~26%** (`qsa attn` 14.3→15.4% + `qsa proj` 7.4–7.8% + `qsa select`
+  0.8→3.3% + indexer gemms 0.2%).
+- **HC family ~12%** (write 2.8% + read down+silu 4.2% + up 2.3–2.4% + mix 1.9–2.0% + inject 0.9%).
+- Everything else ≤ ~4%: router+shared 3.1–3.8%, combine 1.5–1.9%, host grouping ≤0.6%, dequant
+  ≤0.5%, ple 0.4–0.5%, embed 0.2–0.7%. Host staging adds 2–3% on top of the GPU timeline
+  (4,102 ms on 133,410 ms wall at 128k).
+
+So the structural guess was wrong: experts are a third of the story, and the GDN family (running the
+non-WMMA scalar path on this card) plus QSA attention together are ~55% of the prefill timeline.
+The 128k numbers: GPU timeline 133,301 ms / wall 133,410 ms, PP 1,001.6 tok/s — in line with the
+§6.35 med-of-3 row, so timing instrumentation added no measurable overhead.
+
+TG shares are not covered by this timer (decode uses STRATA_DECODE_TIMING, still an open §8 item 7).
+
+**6.36 GDN quad path on gfx1030 (11-19, env-only, first pass).** The §10 code read showed the
+Aurora recurrence kernels (`gdn_rec_quad_kernel`, `_pp`, `_2c`) are plain FP32 SIMT — LDS staging,
+wave shuffles, no WMMA — compiled into every HIP build and selected only by `STRATA_GDN_HEAD=1`
+(default on for gfx1151 only). So the experiment needed no port. Three arms, same day, single
+runs, on the F-2 build (details and phase tables in `bench/notes/v620-TUNING.md`, R1a):
+
+- `GDN_HEAD=1`: 128k PP 1020.5 tok/s (+1.9% over the timing baseline); `gdn recurrence` −30%.
+- `+GDN_PP=1`: 1020.9 — the extra recurrence win is handed back elsewhere.
+- `+GDN_PP=2`: **1027.1 (+2.55%)**; `gdn recurrence` 12,135 → 5,962 ms (−51%); the win
+  concentrates at 64k/128k and is a wash at 16k/32k.
+
+Cost inside the family: the quad path pairs with a grid-stride out-norm kernel that is slower
+on the V620 than the old per-token launch (`gdn out proj` +18%, +419 ms) — a one-line decouple
+is the follow-up upstream proposal. All non-GDN phases stayed within ±0.3%. **Promoted 11-19:**
+med-of-3 (both arms same evening, baseline last and warmest) gives 128k PP 1024.0 vs 987.0
+(**+3.75%**) and 64k 1036.0 vs 1005.4 (**+3.0%**) — far outside the ±0.3% noise floor, with the
+thermal bias running against the winner. The `STRATA_STATE_HASH_GDN=1` cross-arm check returned
+identical state hashes, so the quad path is bit-exact on this card. The daily F-2 config now
+carries `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`.
+
+**6.37 F-3: the out-norm decouple — rejected (11-19 evening).** The phase tables said the quad
+path's paired grid-stride out-norm kernel loses ~940 ms to the old per-token launch at 128k, so F-3
+added `STRATA_GDN_OUTNORM=0` to variant 1 (6 lines in `kernels.cu`, default unchanged) and the quick
+test read +1.7% at 64k on one pass. Med-of-3 said no: **1007.5/1014.1/1022.4/1002.4** vs PP2's
+1023.0/1024.3/1036.0/1024.0 — a loss at every tier (−1.0% to −2.1%), patch reverted from the F-2
+branch. Two lessons recorded. First, the single-pass 64k win was thermal ordering, not code: the F-3
+arm ran first on a cooler card and its own three passes sagged monotonically (1033.5→1022.4→1022.2);
+only med-of-3 comparisons mean anything, exactly as §3.1 says. Second, the phase table misled: the
+per-token launch (`T×HV` blocks, ~6.4 M at 128k) overlaps into the next phase's measurement window,
+so `gdn out proj` looked −944 ms while `gdn recurrence` looked +3.6 s worse; the GPU timeline and
+end-to-end tok/s are the judges. The upstream "one-line decouple" proposal is withdrawn on this
+card's evidence. The `on0` config (`~/strata-v620-iq3_s-T9-0216-f2-gdn-pp2-on0.json`) and logs stay
+as the record.
+
+**6.38 Second three-arm bench: 0.2.20-dev base, MMQ retired, GDN carries over (11-23).** Upstream
+had moved 1,378 commits (two releases: v0.2.19, v0.2.20) and 0.2.16 had restructured the repo
+(`engine/`, `terminal/`, ...; the config paths moved to `terminal/data`, `terminal/tools/hip`) and
+deleted the whole llama.cpp MMQ build path, so the arms changed shape: A = generation-5 stack
+(0.2.15-dev + F-2 + MMQ, re-run for same-day anchoring), B = 0.2.20-dev vanilla (`73d4f4196`),
+C = 0.2.20-dev + F-2 (cherry-pick `80e4a0a48`, branch `v620-0220-f2`, later renamed; the only
+conflict was the parity test file). Same protocol as 11-18: med-of-3, parking off, boot order
+A, B, C. Results in the §5.2 table. Findings: (1) F-2 survived the `src/` to `engine/src/` rename
+and is still worth +1.0-2.2% on the new base; (2) vanilla 0.2.20 is at parity with vanilla
+0.2.15-dev, so upstream's own-kernel rewrite did not cost gfx1030 anything; (3) the old MMQ stack
+(A) and the new base + F-2 (C) are within noise of each other on PP. With MMQ unbuildable, C was
+promoted to generation 6. Then the §6.36 GDN quad-path env was re-tested on the new base
+(med-of-4 at 64k/128k, then med-of-3 at 16k/32k, server already warm): **+4.1-4.5% at every
+tier** — unlike 11-19 (0.2.16), where the win concentrated at 64k/128k, on 0.2.20 the low tiers
+win too. Generation 6 therefore = 0.2.20-dev + F-2 + `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`, with
+new records 1054.4 / 1051.9 / 1048.4 / 1037.8 (§5.2). The GDN promotion of 11-19 had been recorded
+but never wired into the wrapper (v5 stayed the served config); gen-6 closes that gap. Housekeeping
+along the way: the worktree was renamed to the archive name `v620-0215-f2-mmq` with the gen-5
+binary backed up as `~/engines/backup/strata-0.2.15-dev-f2-mmq`, and the daily home
+(`~/git/v620-gfx1030-tuned`, branch of the same name) now holds generation 6.
