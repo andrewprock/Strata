@@ -807,7 +807,8 @@ promoted to generation 6. Then the §6.36 GDN quad-path env was re-tested on the
 (med-of-4 at 64k/128k, then med-of-3 at 16k/32k, re-run fresh-boot parking-off after a
 first warm-server look to validate protocol): **+4.1-5.2% at every tier** — unlike 11-19 (0.2.16), where the win concentrated at 64k/128k, on 0.2.20 the low tiers
 win too. Generation 6 therefore = 0.2.20-dev + F-2 + `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`, with
-new records 1061.6 / 1054.8 / 1048.4 / 1037.8 (§5.2). The GDN promotion of 11-19 had been recorded
+new records 1061.6 / 1054.8 / 1048.4 / 1037.8 (§5.2) - the first configuration
+on this card to clear 1000 PP at every tier. The GDN promotion of 11-19 had been recorded
 but never wired into the wrapper (v5 stayed the served config); gen-6 closes that gap. Housekeeping
 along the way: the worktree was renamed to the archive name `v620-0215-f2-mmq` with the gen-5
 binary backed up as `~/engines/backup/strata-0.2.15-dev-f2-mmq`, and the daily home

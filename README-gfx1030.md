@@ -210,6 +210,9 @@ Reading the table:
 - All-time records for this card: the D row at every tier. The previous
   IQ3_S bests were 995.7 / 1008.7 / 1013.5 / 1002.9 (generation 5,
   2026-11-18).
+- **First configuration on this card to clear 1000 PP at every tier** -
+  at 3.1-bit weights, no less. The tier curve is nearly flat now: only -2%
+  from 16k to 128k.
 
 For context, the same box on other quant lanes (med-of-3, earlier dates):
 
