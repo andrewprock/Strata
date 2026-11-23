@@ -81,7 +81,7 @@ see the note at the end of this section.)
 - Why: it is free speed - no patch, no rebuild, bit-exact (verified with
   `STRATA_STATE_HASH_GDN=1` cross-arm state hashes on 11-19).
 - Measured effect: on 0.2.16 it won only at 64k/128k; on 0.2.20 it wins at
-  every tier, +4.1 to +4.5% prompt processing (2026-11-23, see section 4).
+  every tier, +4.1 to +5.2% prompt processing (2026-11-23, see section 4).
 
 ### Retired: MMQ VOP3P patches (were: vendored ggml, prefill path)
 
@@ -182,7 +182,8 @@ see section 5) and remove `kv-resident`. For daily use, keep them as shown.
 ## 4. Current results
 
 Model: **Qwen3.8-Flash-Next, IQ3_S**, on this V620. Med-of-3 (med-of-4 at
-64k/128k for the GDN row), same-day, parking off, 2026-11-23. PP / TG in
+64k/128k for the GDN row; the 16k/32k GDN passes were re-run fresh-boot
+after a first warm-server look), same-day, parking off, 2026-11-23. PP / TG in
 tokens per second.
 
 | Build | 16k | 32k | 64k | 128k |
@@ -190,11 +191,11 @@ tokens per second.
 | A: generation 5, re-run (0.2.15-dev + F-2 + MMQ) | 998.5 / 98.0 | 1012.5 / 93.2 | 1016.6 / 94.5 | 1005.2 / 92.2 |
 | B: vanilla upstream main (0.2.20-dev) | 990.2 / 99.3 | 988.1 / 100.1 | 997.3 / 96.9 | 979.7 / 93.1 |
 | C: 0.2.20-dev + F-2 | 1009.1 / 100.7 | 1010.0 / 96.8 | 1007.1 / 95.7 | 997.0 / 93.4 |
-| **D: this branch** (C + GDN quad path) | **1054.4 / 100.6** | **1051.9 / 99.1** | **1048.4 / 94.7** | **1037.8 / 93.7** |
+| **D: this branch** (C + GDN quad path) | **1061.6 / 103.6** | **1054.8 / 99.6** | **1048.4 / 94.7** | **1037.8 / 93.7** |
 
 Reading the table:
 
-- **The GDN quad path is the big lever now: +4.1 to +4.5% reading speed at
+- **The GDN quad path is the big lever now: +4.1 to +5.2% reading speed at
   every tier, for two environment variables and no patch.** On 0.2.16 it only
   won at 64k/128k; on 0.2.20 the low tiers win too.
 - **F-2 still matters on current main**: C beats B by +1.0 to +2.2% PP at

@@ -399,9 +399,9 @@ mostly the batch flip, not the other changes listed.
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
 │ 11-23  │ 0.2.20-dev + F-2 (80e4a0a48): F-2 worth +1.0-2.2%            │ 1009.1/100.7  │ 1010.0/96.8   │ 1007.1/95.7   │ 997.0/93.4    │
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
-│ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1054.4/100.6  │ 1051.9/99.1   │ 1048.4/94.7   │ 1037.8/93.7   │
+│ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1061.6/103.6  │ 1054.8/99.6   │ 1048.4/94.7   │ 1037.8/93.7   │
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
-│        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-4.5%           │               │               │               │               │
+│        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-5.2%           │               │               │               │               │
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
 
@@ -804,10 +804,10 @@ and is still worth +1.0-2.2% on the new base; (2) vanilla 0.2.20 is at parity wi
 0.2.15-dev, so upstream's own-kernel rewrite did not cost gfx1030 anything; (3) the old MMQ stack
 (A) and the new base + F-2 (C) are within noise of each other on PP. With MMQ unbuildable, C was
 promoted to generation 6. Then the §6.36 GDN quad-path env was re-tested on the new base
-(med-of-4 at 64k/128k, then med-of-3 at 16k/32k, server already warm): **+4.1-4.5% at every
-tier** — unlike 11-19 (0.2.16), where the win concentrated at 64k/128k, on 0.2.20 the low tiers
+(med-of-4 at 64k/128k, then med-of-3 at 16k/32k, re-run fresh-boot parking-off after a
+first warm-server look to validate protocol): **+4.1-5.2% at every tier** — unlike 11-19 (0.2.16), where the win concentrated at 64k/128k, on 0.2.20 the low tiers
 win too. Generation 6 therefore = 0.2.20-dev + F-2 + `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`, with
-new records 1054.4 / 1051.9 / 1048.4 / 1037.8 (§5.2). The GDN promotion of 11-19 had been recorded
+new records 1061.6 / 1054.8 / 1048.4 / 1037.8 (§5.2). The GDN promotion of 11-19 had been recorded
 but never wired into the wrapper (v5 stayed the served config); gen-6 closes that gap. Housekeeping
 along the way: the worktree was renamed to the archive name `v620-0215-f2-mmq` with the gen-5
 binary backed up as `~/engines/backup/strata-0.2.15-dev-f2-mmq`, and the daily home
