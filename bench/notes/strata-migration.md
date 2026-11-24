@@ -691,6 +691,9 @@ issue #3930 (2×2080 Ti) shows writing 35.2→51.0 with the decode-timing window
 - **`bench/notes/tg-speedup-plan.md`** — the decode-side speed-up campaign document (from the §6.39
   review, 11-23): per-token traffic budget, the ten ranked ideas with a status column, the order of
   attack, and the verdicts as they are measured.
+- **`bench/notes/pp-speedup-record.md`** — the consolidated prompt-processing record (11-23):
+  hardware constraints, the five inner loops and phase shares, the adopted/rejected PP tables, the
+  open PP threads. The section-10 code read moved there.
 - **The 9 environment variables that every lane config carries** (what each does):
   `STRATA_WATCHDOG_S=300` (restart watchdog timer), `STRATA_PLE_BATCH=1` (batched expert reading),
   `STRATA_HIP_PROMPT_F16=1` (FP16 prompt path), `STRATA_SELECT_SIMT=1` (the fast scorer),
@@ -713,126 +716,7 @@ the patches do not (they are stranded on the pre-0.2.16 stack, §6.35).
 
 The five loops that matter, in priority order for this card:
 
-1. **MoE expert tile GEMM, prefill** (`engine/src/kernels/cuda/i8_expert.cuh`, `i8_kernel<T, GU>`;
-   default-on for gfx1030 in this build — the daily config sets no `STRATA_EXPERT_I8`). A block owns
-   64 weight rows × 16 token entries, walks K in 128-value stages; each thread decodes one 32-value
-   sub-block into int8 in shared memory **once per tile** (not per 4 rows — that is what separates it
-   from the `native_expert_grouped` few-rows route, which is chosen only when a layer's groups average
-   under ~7 rows per expert, never at our prompt sizes). Then 8 dp4a + integer scale algebra + one
-   float FMA per 32 values, exact integer arithmetic. RDNA2 polish already in: first-dot src2=0,
-   16-byte scale records with `mul24/mad24`, sign via a 256-entry XOR-mask table, LDS rows padded to
-   36 dwords, `I8_BLK_UNROLL=1` because full unroll spills 55–200 VGPRs on gfx1031. Measured
-   1.10–1.35× over MMQ on an RX 6700 XT (upstream's number, not ours). **The main research target:**
-   tile shape and VGPR budget were tuned on a 6700 XT, not a 72-CU V620.
-2. **Dense projection GEMMs, prefill** (`engine/src/prefill/gemm.cu` → rocBLAS/hipBLASLt). On gfx1030
-   rocBLAS only ships tuned kernels for FP16→FP16, int8 and FP32→FP32, so `prompt_f16()` routes
-   prompt GEMMs FP16-in/FP32-accumulate — default-on for gfx103x now (measured 11–14% faster
-   upstream). This is the loop F-2 attacks (skip-widen, `STRATA_HC_MIX_H16=1`, +1.8–1.9% §6.35).
-   Remaining levers: the opt-in own SGEMM (`STRATA_RDNA2_SGEMM=1`, author-side 343→534 tok/s on an
-   RX 6800, not bit-identical, not default) and the rocBLAS tuning table. Mostly harvested.
-3. **Expert GEMV + PLE, decode** (`native_mmvq.cu` `iq_mmvq`, transcribed from llama.cpp mmvq;
-   `ple.cu` single-token BF16/F32 MMVF, `STRATA_PLE_BATCH=1`). Decode is bandwidth-bound: 12,333
-   experts cached in 23.4 GiB VRAM, the rest streamed from the 46.8 GiB locked-RAM pool. Instruction
-   choice inside the dot barely matters here; cache hit rate, PCIe and PLE batching decide TG.
-4. **GDN linear-attention recurrence** (`native_gdn.cu` adapted from llama.cpp's gated_delta_net;
-   `fused_gdn.cu`, `gdn.cu`). gfx1030 runs the direct scalar form — the chunked WMMA/WY scan is
-   gfx11+ only. Warp owns a (head, column) state in registers; latency-shaped, a fixed per-layer
-   cost on PP and part of the per-token critical path on TG.
-5. **Attention + hyper-connection GEMVs** (`qsa*.cu`, `gr.cu`, `kv_q8.cu`/`kv_q4.cu`). Pure SIMT;
-   `gr.cu`'s warp-per-row lesson is documented in its header (the first version launched one block
-   and cost 262 ms/token). QSA keeps scores in shared memory and picks top-k by binary-lifting
-   threshold search.
-
-Measured phase shares (11-19, `STRATA_PREFILL_TIMING=1`, F-2 worktree build, one tier pass;
-shares of the GPU timeline, stable across 16k/32k/64k/128k):
-
-- **Expert GEMM ("gemm gate/up") 26–28%** — biggest single phase, stable across tiers (26.7% @16k,
-  27.9% @32k, 26.8% @64k, 26.0% @128k). A 10% kernel win here is only ~2.5–3% overall PP.
-- **GDN family 28–29%** (`gdn` 14% + `gdn recurrence` 7.6→9.1% + `gdn out proj` 4.4–4.8% +
-  `gdn conv+gates` 1.2%) — as large as the experts, and on gfx1030 it runs the non-WMMA scalar path.
-  Now the most interesting research target, arguably ahead of the experts.
-- **QSA attention family ~26%** (`qsa attn` 14.3→15.4% + `qsa proj` 7.4–7.8% + `qsa select`
-  0.8→3.3% + indexer gemms 0.2%).
-- **HC family ~12%** (write 2.8% + read down+silu 4.2% + up 2.3–2.4% + mix 1.9–2.0% + inject 0.9%).
-- Everything else ≤ ~4%: router+shared 3.1–3.8%, combine 1.5–1.9%, host grouping ≤0.6%, dequant
-  ≤0.5%, ple 0.4–0.5%, embed 0.2–0.7%. Host staging adds 2–3% on top of the GPU timeline
-  (4,102 ms on 133,410 ms wall at 128k).
-
-So the structural guess was wrong: experts are a third of the story, and the GDN family (running the
-non-WMMA scalar path on this card) plus QSA attention together are ~55% of the prefill timeline.
-The 128k numbers: GPU timeline 133,301 ms / wall 133,410 ms, PP 1,001.6 tok/s — in line with the
-§6.35 med-of-3 row, so timing instrumentation added no measurable overhead.
-
-TG shares are not covered by this timer (decode uses STRATA_DECODE_TIMING, still an open §8 item 7).
-
-**6.36 GDN quad path on gfx1030 (11-19, env-only, first pass).** The §10 code read showed the
-Aurora recurrence kernels (`gdn_rec_quad_kernel`, `_pp`, `_2c`) are plain FP32 SIMT — LDS staging,
-wave shuffles, no WMMA — compiled into every HIP build and selected only by `STRATA_GDN_HEAD=1`
-(default on for gfx1151 only). So the experiment needed no port. Three arms, same day, single
-runs, on the F-2 build (details and phase tables in `bench/notes/v620-TUNING.md`, R1a):
-
-- `GDN_HEAD=1`: 128k PP 1020.5 tok/s (+1.9% over the timing baseline); `gdn recurrence` −30%.
-- `+GDN_PP=1`: 1020.9 — the extra recurrence win is handed back elsewhere.
-- `+GDN_PP=2`: **1027.1 (+2.55%)**; `gdn recurrence` 12,135 → 5,962 ms (−51%); the win
-  concentrates at 64k/128k and is a wash at 16k/32k.
-
-Cost inside the family: the quad path pairs with a grid-stride out-norm kernel that is slower
-on the V620 than the old per-token launch (`gdn out proj` +18%, +419 ms) — a one-line decouple
-is the follow-up upstream proposal. All non-GDN phases stayed within ±0.3%. **Promoted 11-19:**
-med-of-3 (both arms same evening, baseline last and warmest) gives 128k PP 1024.0 vs 987.0
-(**+3.75%**) and 64k 1036.0 vs 1005.4 (**+3.0%**) — far outside the ±0.3% noise floor, with the
-thermal bias running against the winner. The `STRATA_STATE_HASH_GDN=1` cross-arm check returned
-identical state hashes, so the quad path is bit-exact on this card. The daily F-2 config now
-carries `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`.
-
-**6.37 F-3: the out-norm decouple — rejected (11-19 evening).** The phase tables said the quad
-path's paired grid-stride out-norm kernel loses ~940 ms to the old per-token launch at 128k, so F-3
-added `STRATA_GDN_OUTNORM=0` to variant 1 (6 lines in `kernels.cu`, default unchanged) and the quick
-test read +1.7% at 64k on one pass. Med-of-3 said no: **1007.5/1014.1/1022.4/1002.4** vs PP2's
-1023.0/1024.3/1036.0/1024.0 — a loss at every tier (−1.0% to −2.1%), patch reverted from the F-2
-branch. Two lessons recorded. First, the single-pass 64k win was thermal ordering, not code: the F-3
-arm ran first on a cooler card and its own three passes sagged monotonically (1033.5→1022.4→1022.2);
-only med-of-3 comparisons mean anything, exactly as §3.1 says. Second, the phase table misled: the
-per-token launch (`T×HV` blocks, ~6.4 M at 128k) overlaps into the next phase's measurement window,
-so `gdn out proj` looked −944 ms while `gdn recurrence` looked +3.6 s worse; the GPU timeline and
-end-to-end tok/s are the judges. The upstream "one-line decouple" proposal is withdrawn on this
-card's evidence. The `on0` config (`~/strata-v620-iq3_s-T9-0216-f2-gdn-pp2-on0.json`) and logs stay
-as the record.
-
-**6.38 Second three-arm bench: 0.2.20-dev base, MMQ retired, GDN carries over (11-23).** Upstream
-had moved 1,378 commits (two releases: v0.2.19, v0.2.20) and 0.2.16 had restructured the repo
-(`engine/`, `terminal/`, ...; the config paths moved to `terminal/data`, `terminal/tools/hip`) and
-deleted the whole llama.cpp MMQ build path, so the arms changed shape: A = generation-5 stack
-(0.2.15-dev + F-2 + MMQ, re-run for same-day anchoring), B = 0.2.20-dev vanilla (`73d4f4196`),
-C = 0.2.20-dev + F-2 (cherry-pick `80e4a0a48`, branch `v620-0220-f2`, later renamed; the only
-conflict was the parity test file). Same protocol as 11-18: med-of-3, parking off, boot order
-A, B, C. Results in the §5.2 table. Findings: (1) F-2 survived the `src/` to `engine/src/` rename
-and is still worth +1.0-2.2% on the new base; (2) vanilla 0.2.20 is at parity with vanilla
-0.2.15-dev, so upstream's own-kernel rewrite did not cost gfx1030 anything; (3) the old MMQ stack
-(A) and the new base + F-2 (C) are within noise of each other on PP. With MMQ unbuildable, C was
-promoted to generation 6. Then the §6.36 GDN quad-path env was re-tested on the new base
-(med-of-4 at 64k/128k, then med-of-3 at 16k/32k, re-run fresh-boot parking-off after a
-first warm-server look to validate protocol): **+4.1-5.2% at every tier** — unlike 11-19 (0.2.16), where the win concentrated at 64k/128k, on 0.2.20 the low tiers
-win too. Generation 6 therefore = 0.2.20-dev + F-2 + `STRATA_GDN_HEAD=1 STRATA_GDN_PP=2`, with
-new records 1061.6 / 1054.8 / 1048.4 / 1037.8 (§5.2) - the first configuration
-on this card to clear 1000 PP at every tier. The GDN promotion of 11-19 had been recorded
-but never wired into the wrapper (v5 stayed the served config); gen-6 closes that gap. Housekeeping
-along the way: the worktree was renamed to the archive name `v620-0215-f2-mmq` with the gen-5
-binary backed up as `~/engines/backup/strata-0.2.15-dev-f2-mmq`, and the daily home
-(`~/git/v620-gfx1030-tuned`, branch of the same name) now holds generation 6.
-
-**6.39 TG inner-loop review (11-23, planning only — no measurements yet).** The PP side of this card
-has been tuned to the point where TG is the smaller half of the story, so the decode inner loops got
-the same treatment the §10 prefill read gave PP. Sources: `engine/src/split/src/{engine.cu, moe.cuh,
-dense.cuh, qdot.cuh, iqdot_hip.cuh, model.cpp}`, the boot log, and the pack layout. The per-token
-budget at TG ~100 tok/s: routed experts ~0.98 GB (48 layers x 10 experts x 2.05 MB, against the
-23.4 GiB cache at an 89.7% hit rate — misses read ~2 MB blobs from the 46 GiB page-locked arena over
-PCIe), forced-Q8_0 dense ~0.85 GB (qkvz, ssm_out, wo, hc down/up, shared experts — `wanted_type`
-pins them; `dense.bin` is 1.43 GiB), the output head 0.68 GB per draft window (amortized over the
-~4 accepted rows), plus int8 KV, GDN state, and the 802 MiB draft. That is ~2 GB/token, about
-200 GB/s effective against the ~672 GB/s peak: 30%. The gap is miss stalls, the ~400-kernel-per-token
-launch chain (no CUDA graphs; explicit streams), and latency-bound small kernels. So TG is not noise
-here; there is headroom. 
-The ten ideas, their expected size and cost, and the order of attack moved to their own working
-document, `bench/notes/tg-speedup-plan.md` (11-23), which also carries the status column and the
-verdicts as they are measured. Nothing measured yet.
+The five loops and the measured phase shares moved to their own document,
+`bench/notes/pp-speedup-record.md` (11-23), together with the consolidated adopted/rejected PP
+tables and the open PP threads (I8 tile retune for the V620, GDN scalar recurrence,
+STRATA_RDNA2_SGEMM). This section keeps the constraint paragraphs as the record of the read.
