@@ -1,0 +1,66 @@
+# TG speed-up plan (gfx1030 / V620)
+
+Recorded 2026-11-23 on branch `v620-gfx1030-tuned` (generation 6: 0.2.20-dev + F-2 + GDN env).
+This is the working document for the decode-side speed-up campaign; the migration doc's section 6.39
+holds the one-line record and points here. Each idea gets a Status update and its verdict appended
+below as it is measured, same discipline as the migration doc's experiments.
+
+## The per-token budget
+
+Read from `engine/src/split/src/{engine.cu, moe.cuh, dense.cuh, qdot.cuh, iqdot_hip.cuh, model.cpp}`,
+the boot log, and the pack layout. Per generated token the GPU moves roughly:
+
+| Stream | Bytes/token | Source |
+|---|---|---|
+| Routed experts (48 L x 10 x 2.05 MB) | ~0.98 GB | 23.4 GiB VRAM cache, 89.7% hit; misses read ~2 MB blobs from the 46 GiB page-locked arena over PCIe |
+| Forced-Q8_0 dense (qkvz, ssm_out, wo, hc down/up, shared experts) | ~0.85 GB | `dense.bin`, 1.43 GiB total, VRAM, every token |
+| Output head (2560 x 248320, Q8_0) | 0.68 GB per window | amortized over the ~4 accepted rows of a spec-5 window |
+| KV (int8), GDN state, draft model (Q2_0, 802 MiB) | small | VRAM |
+
+Total ~2 GB/token; at TG ~100 tok/s that is ~200 GB/s effective against the V620's ~672 GB/s peak:
+30%. The gap is expert-cache miss stalls, the ~400-kernel-per-token launch chain (explicit streams,
+no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is headroom.
+
+## The ten ideas, best first
+
+┌────┬──────────────────────────────────────────────────────────────┬──────────────┬────────────┬──────────────┐
+│ #  │ Idea                                                         │ Expect       │ Cost       │ Status       │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 1  │ Expert-cache misses: rebuild expert-profile.bin on the real  │ +3-7%        │ cfg        │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 2  │ Re-pack forced-Q8_0 dense below Q8_0 (qkvz, ssm_out, wo, hc, │ +5-10%       │ med        │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 3  │ Output head Q8_0 -> Q6_K or IQ4_XS (0.68 GB per window, 44%  │ +2-4%        │ lo-med     │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 4  │ Router logits F32 -> BF16 (ffn_gate_inp forced F32, 252 MB/t │ +1-2%        │ low        │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 8  │ Sweep the CPU expert share (--pcie-frac 0.00 now): AVX-2 CPU │ 0-3%         │ triv       │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │ not started  │
+├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
+│ 10 │ Second V620 (NCARD=2 layer split): cache capacity -> ~99% hi │ +20-40%      │ $$         │ not started  │
+└────┴──────────────────────────────────────────────────────────────┴──────────────┴────────────┴──────────────┘
+
+## Order of attack
+
+1. Config sweeps first (5, 8, then 1's reserve/telemetry levers) — an afternoon of tier benches.
+2. Hugepages + memlock boot (7) — one interactive sudo, zero code.
+3. The dense re-pack trio (2, 3, 4) — one `tools/iq_pack.py` rebuild can test all three; verify with
+   the parity harness before adopting.
+4. Kernel fusions (6, 9) — real engine work, bit-exactness care on summation order.
+
+## Measurement discipline
+
+TG drift on this box is +/-3-4% same-binary (proven repeatedly; see migration doc section 5). Any
+idea claiming less than ~3% needs med-of-5 or interleaved arms, not the usual med-of-3. PP is the
+reliable +/-0.3-0.5% signal and several ideas move PP too (7, 10) — watch both.
+
+## Verdicts (append as measured)
+
+(nothing measured yet)

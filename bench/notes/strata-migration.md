@@ -644,7 +644,7 @@ issue #3930 (2×2080 Ti) shows writing 35.2→51.0 with the decode-timing window
 9. **Generation-6 decision** — closed 11-23: the wanted same-day round ran (generation-5 binary as
    arm A vs 0.2.20-dev arms, §6.38). Parity on PP without GDN, and with the GDN env the new base wins
    every tier by +4.1–4.5%; promoted as generation 6.
-10. **TG speed-up plan** — the §6.39 review (11-23) lists ten ideas for the decode inner loops with
+10. **TG speed-up plan** — `bench/notes/tg-speedup-plan.md` (from the §6.39 review, 11-23) lists ten ideas for the decode inner loops with
    expected size and cost, best first: config sweeps (spec depth, pcie-frac, expert-profile rebuild)
    first, then the hugepages/memlock boot, then the dense re-pack trio, then kernel fusions. None
    measured yet; anything under ~3% needs med-of-5 against the +/-3-4% TG drift.
@@ -688,6 +688,9 @@ issue #3930 (2×2080 Ti) shows writing 35.2→51.0 with the decode-timing window
   This document's earlier versions: `~/strata-migration.md.bak-20261117-pre-rewrite` and
   `~/strata-migration.md.bak-20261117-post-redundancy`, plus git history (`c8d3f3b2` original →
   `ba97795e` dedup → `08de0232` first rewrite → this one).
+- **`bench/notes/tg-speedup-plan.md`** — the decode-side speed-up campaign document (from the §6.39
+  review, 11-23): per-token traffic budget, the ten ranked ideas with a status column, the order of
+  attack, and the verdicts as they are measured.
 - **The 9 environment variables that every lane config carries** (what each does):
   `STRATA_WATCHDOG_S=300` (restart watchdog timer), `STRATA_PLE_BATCH=1` (batched expert reading),
   `STRATA_HIP_PROMPT_F16=1` (FP16 prompt path), `STRATA_SELECT_SIMT=1` (the fast scorer),
@@ -829,35 +832,7 @@ pins them; `dense.bin` is 1.43 GiB), the output head 0.68 GB per draft window (a
 ~4 accepted rows), plus int8 KV, GDN state, and the 802 MiB draft. That is ~2 GB/token, about
 200 GB/s effective against the ~672 GB/s peak: 30%. The gap is miss stalls, the ~400-kernel-per-token
 launch chain (no CUDA graphs; explicit streams), and latency-bound small kernels. So TG is not noise
-here; there is headroom. The ten ideas, best first:
-┌────┬──────────────────────────────────────────────────────────────┬──────────────┬────────────┐
-│ #  │ Idea                                                         │ Expect       │ Cost       │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 1  │ Expert-cache misses: rebuild expert-profile.bin on the real  │ +3-7%        │ cfg        │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 2  │ Re-pack forced-Q8_0 dense below Q8_0 (qkvz, ssm_out, wo, hc, │ +5-10%       │ med        │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 3  │ Output head Q8_0 -> Q6_K or IQ4_XS (0.68 GB per window, 44%  │ +2-4%        │ lo-med     │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 4  │ Router logits F32 -> BF16 (ffn_gate_inp forced F32, 252 MB/t │ +1-2%        │ low        │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 8  │ Sweep the CPU expert share (--pcie-frac 0.00 now): AVX-2 CPU │ 0-3%         │ triv       │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │
-├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┤
-│ 10 │ Second V620 (NCARD=2 layer split): cache capacity -> ~99% hi │ +20-40%      │ $$         │
-└────┴──────────────────────────────────────────────────────────────┴──────────────┴────────────┘
-
-Order: the config sweeps first (5, 8, then 1's reserve/telemetry levers — an afternoon of tier
-benches), then 7 (one sudo boot, zero code), then the repack trio 2/3/4 (one `iq_pack.py` rebuild
-can test all three; verify with the parity harness), then 6/9 as real engine work. Measurement
-caveat carried from the story so far: TG drift on this box is +/-3-4% same-binary, so any idea
-claiming less than ~3% needs med-of-5 or interleaved arms, not the usual med-of-3. Idea 10 is the
-§7 playbook; note its TG estimate there (~+20-40%) is likely understated because cache capacity
-closes idea 1 entirely.
+here; there is headroom. 
+The ten ideas, their expected size and cost, and the order of attack moved to their own working
+document, `bench/notes/tg-speedup-plan.md` (11-23), which also carries the status column and the
+verdicts as they are measured. Nothing measured yet.
