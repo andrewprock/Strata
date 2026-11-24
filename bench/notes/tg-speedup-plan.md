@@ -34,13 +34,13 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 4  │ Router logits F32 -> BF16 (ffn_gate_inp forced F32, 252 MB/t │ +1-2%        │ low        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ not started  │
+│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECTED 11-24 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 8  │ Sweep the CPU expert share (--pcie-frac 0.00 now): AVX-2 CPU │ 0-3%         │ triv       │ not started  │
+│ 8  │ Sweep the CPU expert share, round 2: 0.05/0.10 + auto/0.55  │ 0-3%         │ triv       │ CLOSED 11-24   │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
@@ -85,3 +85,16 @@ Screening numbers (PP/TG, med-of-3):
 | spec 8 | 1036.6 / 94.2 | 1039.4 / 93.5 |
 | pcie-frac 0.05 | 1036.6 / 99.0 | 1035.2 / 94.7 |
 | pcie-frac 0.10 | 1040.7 / 98.8 | 1038.2 / 94.5 |
+
+**Idea 8, round 2 (auto / 0.55) — CLOSED, 0.00 stays (11-24).** The first round only probed the
+bottom of the range; the engine's design-intent operating points are higher: with `--pcie-frac`
+omitted the native-pack default is 0.55 DMA, and `STRATA_PCIE_FRAC_DEFAULT=auto` probes the link
+in the first decode windows. Both arms ran the same screening protocol. The probe itself measured
+**27.9 GB/s host->device** vs the CPU pool's effective **78.5 GB/s** on missed experts and revised
+0.55 down to 0.15; the bench says even 0.15 loses. Numbers (PP/TG, med-of-3): pfauto (0.15)
+32k 1041.8/95.0, 128k 1039.7/91.9; pfd55 (0.55) 32k 1037.2/97.1, 128k 1036.4/93.3 — vs baseline
+32k 1054.8/99.1-99.6, 128k 1037.8/93.7. Reading: DMA misses contend with other PCIe traffic in a
+way the probe's bandwidth model does not capture, and the CPU computes a missed expert ~3x faster
+than the link can fetch it on this box. The calibration-era 0.00 (6.20) is quantified right, not
+folklore. Provenance: pcie-frac 0.35 lost on the 0.1.47 stack too (same sweep that adopted 0.00).
+Provisional pass files: strata_tier_pass_20261124_{164401,164650,164939,165545,165835,170125}.
