@@ -34,13 +34,13 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 4  │ Router logits F32 -> BF16 (ffn_gate_inp forced F32, 252 MB/t │ +1-2%        │ low        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECTED 11-24 │
+│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECTED 11-2│
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 8  │ Sweep the CPU expert share, round 2: 0.05/0.10 + auto/0.55  │ 0-3%         │ triv       │ CLOSED 11-24   │
+│ 8  │ Sweep the CPU expert share, round 2: 0.05/0.10 + auto/0.55   │ 0-3%         │ triv       │ CLOSED 11-24 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
