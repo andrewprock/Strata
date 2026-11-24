@@ -63,4 +63,25 @@ reliable +/-0.3-0.5% signal and several ideas move PP too (7, 10) — watch both
 
 ## Verdicts (append as measured)
 
-(nothing measured yet)
+**Idea 5 (--spec sweep) — REJECTED (11-24).** Screening at 32k/128k, soak + med-of-3 per arm,
+TIERS=32k,128k, spec-5 baseline from the same day. spec 6: TG -6.8% at 32k, -2.2% at 128k.
+spec 8: -5.1% / -0.2%. Deeper windows lose: acceptance decays past depth ~4-5 (per-window logs
+showed 69-90% while spec 5 ran), and every rejected drafted row costs compute without payback.
+spec 5 stays. spec-min-p untuned (a --spec-min-p sweep below 0.70 with deeper drafts is the only
+remaining shape here, not scheduled).
+
+**Idea 8 (--pcie-frac sweep) — NEUTRAL, no adoption (11-24).** Same screening protocol.
+pcie-frac 0.05: TG -0.3% at 32k, +1.1% at 128k. pcie-frac 0.10: -0.5% / +0.9%. The 128k lean is
+inside the +/-3-4% same-binary TG drift band; PP drifted -1.3 to -1.7% at 32k across all four arms
+(warm-box order effect), which does not change the TG read. CPU-computed misses are as good as PCIe
+reads at a 10.3% miss rate — revisit only if idea 1 raises the miss rate or the second card lands.
+
+Screening numbers (PP/TG, med-of-3):
+
+| Arm | 32k | 128k |
+|---|---|---|
+| baseline (spec 5, pcie 0.00, same day) | 1054.8 / 99.6 | 1037.8 / 93.7 |
+| spec 6 | 1040.3 / 92.5 | 1038.1 / 91.6 |
+| spec 8 | 1036.6 / 94.2 | 1039.4 / 93.5 |
+| pcie-frac 0.05 | 1036.6 / 99.0 | 1035.2 / 94.7 |
+| pcie-frac 0.10 | 1040.7 / 98.8 | 1038.2 / 94.5 |
