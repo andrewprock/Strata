@@ -34,11 +34,11 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 4  │ Router logits F32 -> BF16 (ffn_gate_inp forced F32, 252 MB/t │ +1-2%        │ low        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECTED 11-2│
+│ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECT 11-24 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ CLOSED 11-25 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ not started  │
+│ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ CLOSED 11-25 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 8  │ Sweep the CPU expert share, round 2: 0.05/0.10 + auto/0.55   │ 0-3%         │ triv       │ CLOSED 11-24 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
@@ -50,7 +50,8 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ## Order of attack
 
 1. Config sweeps first (5, 8, then 1's reserve/telemetry levers) — an afternoon of tier benches.
-2. Hugepages + memlock boot (7) — one interactive sudo, zero code.
+2. Hugepages + memlock boot (7) — CLOSED 11-25: already delivered by the THP fallback (see
+   Verdicts); no sudo needed.
 3. The dense re-pack trio (2, 3, 4) — one `tools/iq_pack.py` rebuild can test all three; verify with
    the parity harness before adopting.
 4. Kernel fusions (6, 9) — CLOSED 11-25 before any kernel work: the decode-timing probe bounds
@@ -118,3 +119,19 @@ that ~0.4 ms: an upper bound of ~1.4% of the window if they deleted it outright,
 noise. Both close. The same snapshot sizes the remaining levers: experts 20.4 ms (ideas 2/3/4
 requant, model changes needing sign-off), draft 2.43 ms (spec shape, tuned), CPU-expert misses 1.18
 ms at a 93.6% hit rate (idea 1), commit/emit 0.57, adapt wait 0.50, host 1.77.
+
+**Idea 7 (hugepages + memlock) — CLOSED 11-25, already delivered by the THP fallback.** The engine
+tries MAP_HUGETLB first, and on this box it fails by design (vm.nr_hugepages=0; the boot log asks for
+23983 2 MiB pages) - then falls back to a 2 MiB-aligned anonymous mapping plus MADV_HUGEPAGE. THP on
+this host is madvise mode, so the request lands: the live engine's 47,965 MiB arena region reads
+AnonHugePages 47,964 MiB - 99.998% huge-page coverage today, the same 2 MiB granularity a 24,000-page
+hugetlbfs reservation would provide. The memlock half was moot all along: the process page-locks the
+46.8 GiB arena with an 8 MiB RLIMIT_MEMLOCK (ROCm's cudaHostRegister path does not enforce it here).
+What explicit hugepages would still buy: immovable pages only (THP can theoretically split/move under
+pressure; pinned.cu cites a gfx11 bug where an in-arena huge-page move reset the GPU mid-prompt -
+never observed on gfx1030, and the arena is allocated once at boot into free RAM). If that insurance
+is ever wanted: stop the server, `sudo sysctl -w vm.nr_hugepages=24000`, start the server - the boot
+log will say hugetlb 2 MiB pages instead of the MADV_HUGEPAGE line - at the cost of ~47 GB of
+ordinary RAM. Note for any future A/B: STRATA_NO_LARGEPAGES=1 suppresses both the hugetlb try and the
+MADV_HUGEPAGE request, so under THP=madvise it gives an approximate (khugepaged-permeable) 4 KB arm,
+not a guaranteed one.
