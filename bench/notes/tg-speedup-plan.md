@@ -36,13 +36,13 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 5  │ Sweep --spec 5 -> 6/7/8 and --spec-min-p 0.70 (chosen before │ 0-5%         │ triv       │ REJECTED 11-2│
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ not started  │
+│ 6  │ Fuse the GDN layer's 6-kernel chain: .ab into the Q8Segs mul │ +2-4%        │ med        │ CLOSED 11-25 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 7  │ Hugepages + memlock raise for the 46 GiB expert arena (vm.nr │ +1-3%        │ sudo       │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 8  │ Sweep the CPU expert share, round 2: 0.05/0.10 + auto/0.55   │ 0-3%         │ triv       │ CLOSED 11-24 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │ not started  │
+│ 9  │ Fuse attention-layer tail (qsa_select -> attn_part -> attn_f │ +1-2%        │ med        │ CLOSED 11-25 │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 10 │ Second V620 (NCARD=2 layer split): cache capacity -> ~99% hi │ +20-40%      │ $$         │ not started  │
 └────┴──────────────────────────────────────────────────────────────┴──────────────┴────────────┴──────────────┘
@@ -53,7 +53,8 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 2. Hugepages + memlock boot (7) — one interactive sudo, zero code.
 3. The dense re-pack trio (2, 3, 4) — one `tools/iq_pack.py` rebuild can test all three; verify with
    the parity harness before adopting.
-4. Kernel fusions (6, 9) — real engine work, bit-exactness care on summation order.
+4. Kernel fusions (6, 9) — CLOSED 11-25 before any kernel work: the decode-timing probe bounds
+   everything they could touch at ~0.4 ms of a 27.8 ms window (see Verdicts).
 
 ## Measurement discipline
 
@@ -98,3 +99,22 @@ way the probe's bandwidth model does not capture, and the CPU computes a missed 
 than the link can fetch it on this box. The calibration-era 0.00 (6.20) is quantified right, not
 folklore. Provenance: pcie-frac 0.35 lost on the 0.1.47 stack too (same sweep that adopted 0.00).
 Provisional pass files: strata_tier_pass_20261124_{164401,164650,164939,165545,165835,170125}.
+
+**Idea 9 (attention-tail fusion) — CLOSED 11-25, measured before any kernel work.** Two false starts
+first: the decode-fusion edits went into src/split (the opt-in multi-card engine, built OFF) and then
+into src/qwen35/q36_engine.cu (which only runs qwen35moe files - this model is qwen4exp and decodes
+in src/core/layer.cpp via gemv_quantized). Both were dead code for the daily driver; the q36
+experiment was reverted before commit, the split-tree edits remain (harmless, unused).
+
+The real-engine read also changed the fusion's shape: the 12 attention (QSA) layers carry separate
+attn_q/k/v in MIXED types (Q4_K / IQ3_XS / Q3_K_L per layer, equal on 5 of 12), so a row-concat fuse
+is type-gated, and the chain it would trim (q/k/v MMVQ + prep + quantize + wo) turned out to sit in a
+slice the engine's own probe measures directly. STRATA_DECODE_TIMING=1, 384-token decode, 208 windows,
+27.82 ms/window: GPU-reach wait 20.54 ms, of which VRAM-hit expert MMVs are 20.38 ms - i.e. the
+entire non-MoE GPU work (attention, GDN, norms, every projection) is ~0.2 ms per window, and host
+submit is ~0.18 ms (plan 0.08 + actq 0.09 + jobs 0.01). The fusion classes (wq/wk/wv combine,
+quantize fold into the epilogue, per-row prep merge) and the GDN chain fusion (idea 6) can only attack
+that ~0.4 ms: an upper bound of ~1.4% of the window if they deleted it outright, below the +/-3-4% TG
+noise. Both close. The same snapshot sizes the remaining levers: experts 20.4 ms (ideas 2/3/4
+requant, model changes needing sign-off), draft 2.43 ms (spec shape, tuned), CPU-expert misses 1.18
+ms at a 93.6% hit rate (idea 1), commit/emit 0.57, adapt wait 0.50, host 1.77.
