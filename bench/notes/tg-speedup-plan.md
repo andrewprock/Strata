@@ -204,3 +204,38 @@ bitwise-exact claim holds at the engine level. Adopt candidate: set STRATA_NO_MM
 Still open after this: a B6-style Q8_0 multi-column kernel (activation fragment reused across rows; B6X covers
 only the K-quants) plus wave64 tuning - the remaining gap is the 48-60% of peak the best layout still leaves
 against gfx12's 83-84%, which sizes the full idea-3 build at ~+5-10% TG.
+
+Full-tier A/B of the same change (llm-benchmark/bench_strata_tiers.py, TIERS=16k..128k, 4 counterbalanced
+boots alternating arm order, 2 counted passes each, med-of-4; logs /tmp/ft-*, ~/engines/logs/ftier-sweep.log):
+TG ref -> rows1: 16k 101.2 -> 102.6 (+1.3%), 32k 98.8 -> 97.5 (-1.4%), 64k 95.2 -> 99.9 (+4.9%),
+128k 93.5 -> 96.0 (+2.6%). PP dead even at every tier (+-0.1% or better; the reduced strata_bench run's
+-1% PP was harness artifact). Absolute levels match the canonical tier-sweep record (PP ~985-1043,
+TG ~93-101). Verdict: TG +1.3..+4.9% at three tiers, wash at 32k, PP-neutral, bit-exact outputs -
+the layout stays adopted. Supersedes the reduced strata_bench 4K/16K/32K probe run in between.
+
+## Idea 3, stage 2 (planned 2026-11-26): B6X-style Q8_0 multi-column kernel + wave64 tuning - ENGINE-ONLY build
+
+Scope: kernel source + bench + env flag. No pack rebuild, no re-quantization, no model data, no quality
+change. All work in engine/src/kernels/cuda/s2_gemv.cu (+ dispatch in layer.cpp gemv_quantized), opt-in
+behind an env flag so the default path stays byte-identical until measured (the STRATA_NO_MMVQ_ROWS2
+pattern). Bitwise parity (memcmp, exit 1 on diff, mmvf_rows_parity/native_dense_parity templates) is the
+acceptance test at every step.
+
+The build itself: the daily's dense/head Q8_0 dot (s2_gemv_q8) re-reads the activation blocks once per
+output row; at verify width w=5-7 that is w-fold redundant activation traffic. Two levers:
+1. a B6X-style multi-column Q8_0 kernel - activation block loaded once, reused across w rows
+   (B6X exists only for the K-quant family today; the Q8_0 path has no rows mode at all);
+2. wave64 tuning - DPP row reductions and v_dot4 int8 intrinsics (all present on RDNA2;
+   row_dot64's 64-lane __shfl_xor butterfly already compiles under HIP).
+
+Phases (bench-first):
+1. Screen cheap variants in q8_gemv_bench (dp4a dot vs per-quad dequant, column-paired loads);
+   cold weights, GB/s per shape/width, memcmp exact. Decides the direction before kernel writing.
+2. Write the multi-column kernel (w up to 8), bitwise parity vs s2_gemv_q8.
+3. Real-engine A/B on the full tier harness (bench_strata_tiers.py, counterbalanced boots), env-flag arms.
+4. Adopt only on a measured win: gfx1030 entry in arch_defaults, documented with numbers.
+
+Target: dense+head ~6-8 ms/window of the ~14 ms TG window at 46-64% of peak vs gfx12's demonstrated
+83-84% - closing even half is ~+5-10% TG, stacking on stage 1's +1-5%. The ceiling is extrapolated from
+another card's kernel (gfx12), not measured here - hence phase 1 is a screen, not a commitment.
+Cost: days-scale. Status: NOT STARTED; phase 1 next.
