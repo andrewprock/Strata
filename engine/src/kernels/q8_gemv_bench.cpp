@@ -47,11 +47,13 @@ int main(int argc, char** argv) {
     std::vector<int> cols = {1, 2, 3, 4, 6};
     int iters = 50;
     double bw = 0;
+    bool packed = false;   // --packed: time the registered packed copies (STRATA_Q8_PACKED=1 path) and check bitwise
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cols" && i + 1 < argc) cols = ints(argv[++i]);
         else if (a == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (a == "--bw" && i + 1 < argc) bw = std::atof(argv[++i]);
+        else if (a == "--packed") packed = true;
     }
     cudaDeviceProp prop;
     ck(cudaGetDeviceProperties(&prop, 0), "props");
@@ -71,15 +73,32 @@ int main(int argc, char** argv) {
             ck(cudaMalloc(&p, bytes), "malloc w");
             ck(cudaMemcpy(p, host.data(), bytes, cudaMemcpyHostToDevice), "copy w");
         }
+        // --packed: the STRATA_Q8_PACKED=1 path (native_mmvq.cu): a lossless load-time repack, aligned streaming
+        // loads, bitwise-equal outputs. Registered here the way native_dense.cpp registers engine tensors.
+        bool packed_here = false;
+        std::vector<void*> w2(copies);
+        if (packed && K::native_q8_0_packed_eligible(s.n_in, s.n_out)) {
+            std::vector<uint8_t> phost(bytes);   // same total size: n_in bytes/row + (n_in/32)*2 scale bytes/row
+            K::native_q8_0_pack_host(host.data(), phost.data(), s.n_in, s.n_out);
+            for (auto& p : w2) {
+                ck(cudaMalloc(&p, bytes), "malloc w2");
+                ck(cudaMemcpy(p, phost.data(), bytes, cudaMemcpyHostToDevice), "copy w2");
+                K::native_q8_0_packed_register(p, w2[&p - w2.data()], s.n_in, s.n_out);
+            }
+            packed_here = true;
+        } else if (packed) {
+            std::printf("  (packed: shape not eligible, skipped)\n");
+        }
         const int maxc = *std::max_element(cols.begin(), cols.end());
         std::vector<float> xh((size_t) s.n_in * maxc);
         for (auto& v : xh) v = std::normal_distribution<float>(0.f, 1.f)(rng);
-        float *x = nullptr, *y = nullptr;
+        float *x = nullptr, *y = nullptr, *y2 = nullptr;
         void* xq = nullptr;
         ck(cudaMalloc(&x, xh.size() * 4), "x");
         ck(cudaMemcpy(x, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice), "x copy");
         ck(cudaMalloc(&xq, K::native_q8_1_bytes(s.n_in, maxc)), "xq");
         ck(cudaMalloc(&y, (size_t) s.n_out * maxc * 4), "y");
+        ck(cudaMalloc(&y2, (size_t) s.n_out * maxc * 4), "y2");
         cudaStream_t st;
         ck(cudaStreamCreate(&st), "stream");
         cudaEvent_t e0, e1;
@@ -98,8 +117,22 @@ int main(int argc, char** argv) {
             const double us = 1000.0 * ms / iters, gbs = bytes / (us * 1e3);
             std::printf("  %d col%s: %8.1f us  %7.1f GB/s%s\n", c, c == 1 ? " " : "s", us, gbs,
                         bw > 0 ? (" = " + std::to_string((int) (100 * gbs / bw + 0.5)) + "% of bw").c_str() : "");
+            if (packed_here) {   // the same call now routes to the packed kernel; check it bitwise
+                ck(cudaMemsetAsync(y2, 0, (size_t) s.n_out * c * 4, st), "memset y2");
+                K::native_mmvq(8, w[0], xq, y2, s.n_in, s.n_out, c, st);
+                std::vector<float> a((size_t) s.n_out * c), b((size_t) s.n_out * c);
+                ck(cudaMemcpy(a.data(), y, a.size() * 4, cudaMemcpyDeviceToHost), "y down");
+                ck(cudaMemcpy(b.data(), y2, b.size() * 4, cudaMemcpyDeviceToHost), "y2 down");
+                const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+                std::printf("        packed check: %s\n", same ? "identical" : "DIFFERENT");
+                if (!same) { std::printf("q8_gemv_bench: packed output differs\n"); return 1; }
+            }
         }
         for (auto p : w) cudaFree(p);
+        if (packed_here) {
+            for (const void* p : w2) K::native_q8_0_packed_unregister(p);
+            for (auto p : w2) cudaFree(p);
+        }
         cudaFree(x);
         cudaFree(xq);
         cudaFree(y);

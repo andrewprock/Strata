@@ -237,5 +237,37 @@ Phases (bench-first):
 
 Target: dense+head ~6-8 ms/window of the ~14 ms TG window at 46-64% of peak vs gfx12's demonstrated
 83-84% - closing even half is ~+5-10% TG, stacking on stage 1's +1-5%. The ceiling is extrapolated from
-another card's kernel (gfx12), not measured here - hence phase 1 is a screen, not a commitment.
-Cost: days-scale. Status: NOT STARTED; phase 1 next.
+Cost: days-scale. Status: phase 1 DONE (below), phase 2 (the kernel) next.
+
+Phase 1 screen (2026-11-26, q8_gemv_bench --bw 672 on the V620, cold weights, memcmp-exact, 30 reps):
+- STRATA_Q8_PACKED=1 (the packed Q8_0 decode layout, +10-12% on gfx1151 dense shapes) has NO effect on
+  gfx1030: within +-1% at every shape x column count, bitwise identical. Closed - the gfx1151 win does not
+  transfer. (Packed-shape heads were skipped as ineligible; the eligible shapes showed the same flatness.)
+- STRATA_TSUM=1 (the transposed cross-warp summation, `kTsum`, in the multi-column path) is a real,
+  free, bitwise-exact win in the multi-column kernel. Medians, ref -> TSUM:
+  GDN qkv 2560->10240: 2c +1.3%, 3c +1.5%, 4c +2.9%, 6c +5.6%, 8c +5.4%;
+  GDN gate 2560->6144: 2c +1.9%, 4c +4.6%, 6c +8.3%, 8c +7.9%;
+  QSA q 2560->12288:   2c +1.2%, 4c +2.5%, 6c +5.6%, 8c +4.7%;
+  head 2560->248320:   4c +2.5%, 6c +11.4%, 8c +13.7%.
+  Width 1 is the exact kernel and is untouched. Packed+TSUM = TSUM alone.
+- Why it matters: the daily's spec-5 verify windows are 5-7 wide, exactly the columns where TSUM pays,
+  and the dense/head slice is the stage-1 target. Micro-bench suggests ~+2-4% TG at verify-heavy widths;
+  the full tier harness decides. Next: engine A/B of STRATA_TSUM=1 on bench_strata_tiers.py, then
+  phase 2 (the B6X-style multi-column kernel) only if the residual gap justifies it.
+
+- Full-tier A/B (2026-11-26, /tmp/tsum-tier.sh, same counterbalanced methodology as stage 1:
+  2 boots per arm, 3 passes each, med-of-passes; both arms on the adopted rows1 baseline;
+  logs ~/engines/logs/tsum-tier-sweep.log, /tmp/tsum-*-r*.log), medians, ref -> TSUM:
+  | tier | ref TG | TSUM TG | TG d  | PP d  |
+  | 16k  | 102.0  | 101.0   | -1.0% | +0.1% |
+  | 32k  |  98.6  | 102.1   | +3.5% | -0.3% |
+  | 64k  |  97.8  |  99.5   | +1.7% | -0.0% |
+  | 128k |  96.0  |  96.6   | +0.6% | +0.2% |
+- Verdict: adopt. Positive at 3 of 4 tiers (mean ~+1.2% TG), PP dead neutral, bit-exact outputs;
+  the 16k -1.0% is inside the +/-1-2% boot noise and is the shortest-window tier (least TSUM
+  benefit expected). 32k +3.5% is the strongest single-tier result of the campaign and is the
+  tier where stage-1's rows1 was a wash, so TSUM composes with rows1 rather than overlapping it.
+  Micro-bench predicted +2-4% at verify-heavy widths; the engine delivers +1.7-3.5% there.
+  Daily-config change (STRATA_TSUM=1) recorded 2026-11-26. Phase 2 (the B6X-style
+  multi-column kernel) stays conditional: with stage 1 + TSUM adopted, re-run the dense/head
+  share arithmetic before deciding the remaining gap justifies days of kernel work.
