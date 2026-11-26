@@ -105,7 +105,7 @@ Provisional pass files: strata_tier_pass_20261124_{164401,164650,164939,165545,1
 first: the decode-fusion edits went into src/split (the opt-in multi-card engine, built OFF) and then
 into src/qwen35/q36_engine.cu (which only runs qwen35moe files - this model is qwen4exp and decodes
 in src/core/layer.cpp via gemv_quantized). Both were dead code for the daily driver; the q36
-experiment was reverted before commit, the split-tree edits remain (harmless, unused).
+experiment was reverted before commit, the split-tree edits were left uncommitted, then reverted on 11-25 after review (never built, unused).
 
 The real-engine read also changed the fusion's shape: the 12 attention (QSA) layers carry separate
 attn_q/k/v in MIXED types (Q4_K / IQ3_XS / Q3_K_L per layer, equal on 5 of 12), so a row-concat fuse
@@ -135,3 +135,72 @@ log will say hugetlb 2 MiB pages instead of the MADV_HUGEPAGE line - at the cost
 ordinary RAM. Note for any future A/B: STRATA_NO_LARGEPAGES=1 suppresses both the hugetlb try and the
 MADV_HUGEPAGE request, so under THP=madvise it gives an approximate (khugepaged-permeable) 4 KB arm,
 not a guaranteed one.
+
+## Idea 11 (2026-11-25): EXPDEC on gfx1030 - screened and closed, banner result only
+
+The daily's routed-expert kernels (`native_expert_grouped`, iq_kernels.cu) run the default path on this
+card: `STRATA_EXPDEC=1` is only in the gfx12 defaults table (arch_defaults.cpp), and the native pack's
+experts are IQ2_S gate/up (type 22) + IQ4_NL down (type 20), layers 0/1 IQ3_XXS(18)+Q2_0(42) and
+IQ2_S(22)+Q2_0(42) (packs/iq3_s/native_experts.txt). `expdec_bench` on the V620, real shape, the daily
+pair 22/20 single T=4: def 268.1 us / 294 GB/s vs dec 237.1 us / 333 GB/s (-11.6%); 18/20 flat
+(258.5 vs 257.9, b2 -7%). EXPDEC `r2` loses on the V620 (gu rows per lane 2 measured 20% slower than
+R 1 at real shape). The kernels run at ~45% of the ~672 GB/s peak with per-expert cost a ~6.1 us vs a
+~3.1 us pure-DRAM floor, so the micro-bench still leaves headroom, but a real-engine A/B did not show
+it: `ab_engine.py` ref vs EXPDEC:STRATA_EXPDEC=1,STRATA_EXPDEC_D20=1, 3 interleaved rounds, the daily
+config (logs/ab-expdec.log, ab-expdec.jsonl): decode tok/s within noise, no arm ahead per round and no
+per-request arm ahead on the long prompt. Closed: not worth pursuing on gfx1030. What the screen DID
+establish: the 20.38 ms expert slice in the idea-9 timing snapshot is ~2/3 real kernel time
+(~13-16 ms by micro-bench arithmetic: ~45 hit groups x ~6 us + entries, x48 layers) and ~1/3
+bubbles/copies - a kernel-level fix needs a different shape than EXPDEC's, and the remaining ceiling on
+one card is the ~2x between a=6.1 us and the DRAM floor.
+
+## Idea 12 (2026-11-25): the AMD grouped-expert layouts (STRATA_EXP_MODE 1/2) on gfx1030 - screened and closed
+
+The gfx906-era wave64 layouts in iq_kernels.cu build for every HIP arch but default to mode 0
+("the CUDA layout") everywhere but gfx906; the V620 is also wave64, so the W64 mode (1) was the
+one untested free knob on the biggest slice. expdec_bench, real shapes, the daily's dominant pair
+22/20 (46 of 48 layers), server stopped, 20 reps x 5 rounds, output parity "identical" in all runs
+(no env, and STRATA_EXP_MODE=1 and =2):
+  no env  def: T=1 82.3 us (239.5 GB/s), T=2 147.2 us (267.9); dec 132.8 (296.9)
+  MODE=1: T=1 90.3 us (218.3), T=2 169.2 us (233.1) - ~10-15% SLOWER than mode 0 at every shape
+  MODE=2: 16/20 T=1 68.0 vs 66.2, T=2 124.0 vs 114.6 (+8%) - also slower
+With the env set every arm in the bench collapses to one timing (the env overrides the per-choice
+mode), so the comparison is mode-X vs mode-0 def, and mode 0 wins both times. The gfx906-tuned
+shapes do not transfer to the V620's memory system; the default layout is the best-known config
+for the card's expert kernels. Closed: STRATA_EXP_MODE stays unset. Together with idea 11 this
+says the remaining ~2x to the DRAM floor is not reachable by any existing alternative layout -
+only a new kernel shape (a wave64 Q8_0 DPP GEMV is still unexplored for the dense/head slice,
+and row_dot64's 64-lane __shfl_xor butterfly compiles under HIP, so a hand-tuned variant is
+possible, just not via env).
+
+## Idea 3 sizing (2026-11-26): the daily's Q8_0 dense/head slice on the V620 - measured, build target confirmed
+
+`q8_gemv_bench` (registered, built), server stopped, V620 (sm_103, L2 4096 KB), 500-rep medians, cold weights:
+  head 2560->248320 (675 MB): 430.6 GB/s (w=1) 421.5 (2) 418.0 (3) 410.9 (4) 361.1 (6) - 1.57-1.87 ms per window
+  gdn qkv 2560->10240 (27.9 MB): 374.9-388.3 GB/s at w=1-2, 338.5 at w=6
+  gdn gate/out (16.7 MB): 306-370 GB/s; qsa q 2560->12288: 384-405; shared expert + kv (1.4-3.5 MB): 108-305 (latency-bound)
+  EVERY shape loses 10-25% GB/s from w=1 to w=6 - the verify width is exactly where the loss lands.
+Both existing multi-row knobs are inapplicable to the daily: STRATA_B6_MMVQ_ROWS is the K-quant family
+(old IQ3_XXS-era pack; b6_mmvq_bench A-vs-B on the V620: B ~= A, mixed +-5%), and STRATA_Q80_ROWS1 is
+native_mmvq's sm_120 Q8_0. The daily's Q8_0 routes quantize_q8_0 + s2_gemv_q8, which has NO rows mode.
+Accounting: the idea-9 20.38 ms "VRAM-hit expert MMVs" bucket includes the dense/head GEMVs; split
+~12-14 ms routed-expert kernels + ~6-8 ms dense/head. Dense+head runs at 46-64% of the ~672 GB/s peak
+vs the 83-84% the gfx12 DPP kernels reach, so a wave64-tuned s2_gemv_q8 (multi-col reuse of the
+activation fragment, head included) is worth ~2-3 ms/window ~= +7-11% TG - the biggest measured
+single-card lever so far. Next: build it (Idea 3 proper).
+
+## Idea 3, stage 1 (2026-11-26): the dense Q8_0 one-row layout (STRATA_NO_MMVQ_ROWS2=1) - measured, adopted-candidate
+
+The sizing pass found the daily's dense Q8_0 projections (attention, SSM, shared expert, head) route through
+native_mmvq, whose layouts are per-card: gfx1201 and sm_86 measured the ONE-row-per-block layout faster (73-79% ->
+83-84% of peak on gfx1201) and default to it; other cards, including gfx1030, keep two rows "until measured".
+STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere and is bitwise exact (each row keeps its own partials and
+reduction). Measured today, server stopped (build-hip/q8_gemv_bench --bw 672, 50 reps, cold weights):
+one-row wins at nearly every shape and column count: GDN qkv/gate/out -2..-6%, QSA q -2..-4%, QSA k/v -8..-15%,
+HC down 10240->320 -24..-32%, head -2..-3% at 2-4 columns (+4% at 6), shared gate/up +10% at 2 columns only
+(5 us scale). Real-engine A/B (ab_engine.py, 3 interleaved rounds, logs/ab-rows1.{log,jsonl}): decode medians
++1.3/+1.6/+0.4/+0.3% (chat0/1/2/long), and both arms produced IDENTICAL token counts on every prompt - the
+bitwise-exact claim holds at the engine level. Adopt candidate: set STRATA_NO_MMVQ_ROWS2=1 in the daily config.
+Still open after this: a B6-style Q8_0 multi-column kernel (activation fragment reused across rows; B6X covers
+only the K-quants) plus wave64 tuning - the remaining gap is the 48-60% of peak the best layout still leaves
+against gfx12's 83-84%, which sizes the full idea-3 build at ~+5-10% TG.
