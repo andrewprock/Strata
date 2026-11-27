@@ -401,7 +401,16 @@ mostly the batch flip, not the other changes listed.
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
 │ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1061.6/103.6  │ 1054.8/99.6   │ 1048.4/94.7   │ 1037.8/93.7   │
 │        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-5.2%           │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-27  │ TG ladder arm A - pre-campaign env (see tg-speedup-plan.md)  │ 989.0/99.7    │ 1037.7/97.1   │ 1045.0/97.0   │ 1036.0/94.2   │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-27  │ TG ladder arm C - adopted daily (one-row + TSUM), +2.1-3.7%  │ 988.9/101.8   │ 1035.0/100.2  │ 1045.0/98.7   │ 1034.3/97.7   │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-27  │ TG ladder arm D - + HEAD_MIX_MULTI: tier wash, not adopted   │ 988.2/103.7   │ 1034.4/100.8  │ 1044.3/100.6  │ 1033.6/97.4   │
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
+The 11-24 to 11-27 TG campaign - the screens and closures, per-stage A/Bs, and the ladder's
+arm B behind the rows above - is recorded in `bench/notes/tg-speedup-plan.md`; section 6.39
+points there.
 
 ### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
 
@@ -438,6 +447,10 @@ such layer.
 - 0.1.48.1's prefill regression vs 0.1.47 was bounded to ≤16k context, −2.4% calibrated (10-24); never
   bisected (low value).
 - The 128k KV-compaction cycle went 16.4 min → 3.0 min across the record (5.5×).
+- The TG flag campaign (11-27 confirmation ladder, `bench_strata_tiers.py` harness): the best
+  config measures TG 103.7/100.8/100.6/97.4 (ladder arm D) - the same-harness best, achieved by
+  `STRATA_NO_MMVQ_ROWS2=1` + `STRATA_TSUM=1` over the 11-23 daily; not comparable to the
+  turnstile numbers above (different harness). Full record: `bench/notes/tg-speedup-plan.md`.
 
 ---
 

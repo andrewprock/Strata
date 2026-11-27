@@ -5,6 +5,23 @@ This is the working document for the decode-side speed-up campaign; the migratio
 holds the one-line record and points here. Each idea gets a Status update and its verdict appended
 below as it is measured, same discipline as the migration doc's experiments.
 
+## Current status (2026-11-27)
+
+- Adopted, tier-confirmed: `STRATA_NO_MMVQ_ROWS2=1` (stage 1) + `STRATA_TSUM=1` (stage 1b).
+  The confirmation ladder measures the stack at +2.1/+3.2/+1.8/+3.7% TG (16k/32k/64k/128k),
+  PP +-0.4%, bit-exact, no flag interactions. Both are in the daily config.
+- Screened, NOT adopted: `STRATA_HEAD_MIX_MULTI=1` - a tier wash twice over (its own sweep and
+  the ladder's D-C step).
+- Closed: EXPDEC (idea 11), the AMD EXP_MODE layouts (idea 12), `STRATA_Q8_PACKED` (no effect on
+  gfx1030), `STRATA_SELECT_SIMT` (tie - keep 1), DFlash2 (measured slower than MTP twice
+  upstream; the daily drafts with the MTP head).
+- Aborted, no verdict: the `STRATA_QFUSE_HC` chat screen (see the section at the end).
+- Ideas 1-4 (pack rebuilds) stay declined by choice; idea 10 (second card) is hardware, not code.
+- Next, the build list, cheapest first: the zero-miss staging-copy gate (device-side gated copy,
+  ~+0.5-1%), batched verify routing for the native 512x10 router (+2-4% est.), the expert-kernel
+  precompute hoist (+3-7% est.), then phase 2 B6X-Q8_0 only if the re-run gap arithmetic says so.
+- The daily driver serves the adopted stack; HEAD_MIX_MULTI must not be added on the strength of
+  its chat screen alone.
 ## The per-token budget
 
 Read from `engine/src/split/src/{engine.cu, moe.cuh, dense.cuh, qdot.cuh, iqdot_hip.cuh, model.cpp}`,
@@ -301,3 +318,13 @@ Headline for the record: adopted stack (A->C) is +2.1/+3.2/+1.8/+3.7% TG; the fu
 (A->D, including the unadopted headmix) is +3.5-4.0% at every tier. Campaign total from the
 adopted config: ~+2.7% mean TG, bit-exact, PP-neutral - from three closed screens (EXPDEC,
 EXP_MODE, Q8_PACKED), one tie (SELECT_SIMT), and two adopted env flags.
+
+## STRATA_QFUSE_HC - screen aborted 2026-11-27, no verdict
+
+The drafter's fused-quantize HC step (default only on gfx1201, #3264). The chat A/B was killed
+mid-run when the headmix tier sweep took the server. One complete round exists
+(logs/ab-qfuse.log, round 0, single measurements): ref chat0 99.4 / chat1 68.4 / chat2 71.6 /
+long 73.7 vs qfuse 94.0 / 68.9 / 69.3 / 63.9 decode tok/s - qfuse behind on 3 of 4 (long -13%),
+but a single round sits inside the +-3-4% chat noise and cannot carry a verdict either way.
+Status: incomplete - rerun with ab_engine.py (ref vs STRATA_QFUSE_HC=1, 3 rounds) before judging.
+It is the last unscreened free flag, and its only data leans negative.
