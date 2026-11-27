@@ -271,3 +271,33 @@ Phase 1 screen (2026-11-26, q8_gemv_bench --bw 672 on the V620, cold weights, me
   Daily-config change (STRATA_TSUM=1) recorded 2026-11-26. Phase 2 (the B6X-style
   multi-column kernel) stays conditional: with stage 1 + TSUM adopted, re-run the dense/head
   share arithmetic before deciding the remaining gap justifies days of kernel work.
+
+## Idea 3, stage 1c (2026-11-27): STRATA_HEAD_MIX_MULTI=1 - screened, tier wash, NOT adopted
+
+The drafter's multi-row head-mix path (CUDA-default-on, HIP opt-in via the gfx12 defaults table,
+mtp.cpp). Chat A/B (3 interleaved rounds, logs/ab-headmix.log): decode medians +0.4/+0.6/+2.6/+0.6%
+(ref 100.2/68.6/70.2/72.5), token counts identical on every request - bit-exact, but 3 of 4 inside
+the noise floor. Full tier (headmix-tier.sh, same counterbalanced methodology, med of 4 counted
+passes): ref TG 103.6/100.0/99.5/95.2 vs headmix 103.3/99.1/98.8/96.1 = -0.2/-0.9/-0.7/+1.0%,
+PP +-0.1%. Verdict: a tier wash. NOT adopted; the daily config keeps rows1+TSUM only. Two
+independent measurements (this sweep and the ladder's D-C step below) agree it is noise-level.
+
+## Confirmation sweep (2026-11-27): 4-arm cumulative flag ladder - adopted stack +2.1-3.7% TG
+
+One-sweep replication of all three stages under identical same-day conditions (ladder-tier.sh,
+2 counterbalanced boots per arm A,B,C,D then D,C,B,A, 1 soak + 2 counted passes each, med of 4
+counted passes; arm A = session-start env minus the three flags, everything else unchanged):
+A none / B +rows1 / C +TSUM / D +headmix, TG tok/s:
+
+  tier |   A     B     C     D   | B-A   C-B   D-C   |  D-A
+  16k  |  99.7  99.9  101.8 103.7 | +0.2  +1.9  +1.9  | +4.0%
+  32k  |  97.1  99.0  100.2 100.8 | +2.0  +1.2  +0.6  | +3.9%
+  64k  |  97.0  98.2  98.7  100.6 | +1.2  +0.5  +1.9  | +3.6%
+  128k |  94.2  96.5  97.7  97.4  | +2.5  +1.2  -0.3  | +3.5%
+
+PP +-0.4% worst cell - prompt-path neutral throughout. Every step is direction-consistent with
+its historical stage measurement inside boot noise; no flag interaction in either direction.
+Headline for the record: adopted stack (A->C) is +2.1/+3.2/+1.8/+3.7% TG; the full ladder
+(A->D, including the unadopted headmix) is +3.5-4.0% at every tier. Campaign total from the
+adopted config: ~+2.7% mean TG, bit-exact, PP-neutral - from three closed screens (EXPDEC,
+EXP_MODE, Q8_PACKED), one tie (SELECT_SIMT), and two adopted env flags.
