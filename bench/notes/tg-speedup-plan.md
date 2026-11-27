@@ -1,8 +1,8 @@
 # TG speed-up plan (gfx1030 / V620)
 
 Recorded 2026-11-23 on branch `v620-gfx1030-tuned` (generation 6: 0.2.20-dev + F-2 + GDN env).
-This is the working document for the decode-side speed-up campaign; the migration doc's section 6.39
-holds the one-line record and points here. Each idea gets a Status update and its verdict appended
+This is the working document for the decode-side speed-up campaign; the migration doc's sections 6.39-6.40
+hold the one-line records and point here. Each idea gets a Status update and its verdict appended
 below as it is measured, same discipline as the migration doc's experiments.
 
 ## Current status (2026-11-27)
@@ -22,6 +22,11 @@ below as it is measured, same discipline as the migration doc's experiments.
   precompute hoist (+3-7% est.), then phase 2 B6X-Q8_0 only if the re-run gap arithmetic says so.
 - The daily driver serves the adopted stack; HEAD_MIX_MULTI must not be added on the strength of
   its chat screen alone.
+- Benchmark protocol: every tier/bench config must carry `--conversation-cache-mib 0` (parking
+  off). The 11-26/27 sweeps ran the daily config's parking on, which costs 16k PP ~9%: a
+  same-day arm-A pair measured 1089.0/1087.2 (off) vs 989.0 (on) - migration doc §6.40. The
+  flag A/Bs above all shared one protocol and stand; their absolute PP is not comparable to
+  the 11-23 Gen-6 medians (1061.6-1037.8, parking off).
 ## The per-token budget
 
 Read from `engine/src/split/src/{engine.cu, moe.cuh, dense.cuh, qdot.cuh, iqdot_hip.cuh, model.cpp}`,

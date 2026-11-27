@@ -409,8 +409,12 @@ mostly the batch flip, not the other changes listed.
 │ 11-27  │ TG ladder arm D - + HEAD_MIX_MULTI: tier wash, not adopted   │ 988.2/103.7   │ 1034.4/100.8  │ 1044.3/100.6  │ 1033.6/97.4   │
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
 The 11-24 to 11-27 TG campaign - the screens and closures, per-stage A/Bs, and the ladder's
-arm B behind the rows above - is recorded in `bench/notes/tg-speedup-plan.md`; section 6.39
-points there.
+arm B behind the rows above - is recorded in `bench/notes/tg-speedup-plan.md`; sections 6.36-6.40
+cover the GDN promotion, the 0.2.20 switch, the campaign, and the parking protocol break. One
+protocol note on the table itself: every row through 11-23 ran parking off
+(`--conversation-cache-mib 0`); the 11-27 ladder rows ran the daily config's parking on, which
+costs 16k PP ~9% (measured same-day pair: 1090.9/1087.2 off vs 989.0 on, §6.40). Compare rows
+within a sweep set, not across the break.
 
 ### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
 
@@ -447,10 +451,12 @@ such layer.
 - 0.1.48.1's prefill regression vs 0.1.47 was bounded to ≤16k context, −2.4% calibrated (10-24); never
   bisected (low value).
 - The 128k KV-compaction cycle went 16.4 min → 3.0 min across the record (5.5×).
-- The TG flag campaign (11-27 confirmation ladder, `bench_strata_tiers.py` harness): the best
-  config measures TG 103.7/100.8/100.6/97.4 (ladder arm D) - the same-harness best, achieved by
-  `STRATA_NO_MMVQ_ROWS2=1` + `STRATA_TSUM=1` over the 11-23 daily; not comparable to the
-  turnstile numbers above (different harness). Full record: `bench/notes/tg-speedup-plan.md`.
+- The TG flag campaign (11-27 confirmation ladder): the best same-protocol config measures
+  TG 103.7/100.8/100.6/97.4 (ladder arm D) over arm A (99.7/97.1/97.0/94.2), achieved by
+  `STRATA_NO_MMVQ_ROWS2=1` + `STRATA_TSUM=1`. Caveat: the ladder ran with the daily config's
+  parking ON while the rows above ran parking off - 16k PP is ~9% low across the break (measured
+  same-day pair, §6.40), so compare this row to arm A only, not to the 11-23 rows. Full record:
+  `bench/notes/tg-speedup-plan.md`.
 
 ---
 
@@ -609,6 +615,34 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
     `~/git/wt-0216-f2` (branch `v620-0216-f2`); configs `~/strata-v620-iq3_s-T9-0216-{vanilla,f2}.json`
     (parking off); build flags `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030
     -DCMAKE_BUILD_TYPE=Release` with `cmake -S engine`; result JSONs
+36. **GDN quad path promoted** (11-19/23). Config-env A/B on the 0.2.16 tip:
+   `STRATA_GDN_HEAD=1` + `STRATA_GDN_PP=2` halve the GDN recurrence's per-layer launch cost
+   (recurrence -51%); +4.1-5.2% PP on every tier, bit-exact. Promoted into generation 6. Redo:
+   configs `~/strata-v620-iq3_s-T9-0216-f2-gdn-{head,pp1,pp2}.json` (parking off); logs
+   `~/engines/logs/arm-0216-f2-gdn-*.log`.
+37. **GDN_OUTNORM=0 ("F-3") rejected** (11-19). The old out-norm launch under the quad path
+   loses every tier in med-of-3 (1007.5/1014.1/1022.4/1002.4 vs the promoted arm); patch
+   reverted the same day. §5.2 row "REJECTED".
+38. **0.2.20 vanilla; upstream deletes the MMQ path** (11-23). The 0.2.20 release removed the
+   llama.cpp-MMQ prompt path; vanilla re-run at 990.2/988.1/997.3/979.7 PP. The Nov 18
+   0.2.15-dev-f2-mmq binary (43 MB, full MMQ symbol set) was archived to `~/engines/backup/`.
+   Generation 6 = 0.2.20-dev + F-2 (`80e4a0a48`) + GDN env: 1061.6/1054.8/1048.4/1037.8 PP -
+   first configuration over 1000 PP at every tier (parking off; med-of-3 at 16k/32k).
+39. **TG speed-up campaign opens** (11-23). The ten-idea decode review; the working record
+   moved to `bench/notes/tg-speedup-plan.md`. Through 11-27: adopted `STRATA_NO_MMVQ_ROWS2=1` +
+   `STRATA_TSUM=1` (ladder-confirmed +2.1/+3.2/+1.8/+3.7% TG vs arm A, PP +-0.4%, bit-exact,
+   no flag interactions); `STRATA_HEAD_MIX_MULTI` wash (not adopted); EXPDEC, EXP_MODE,
+   Q8_PACKED, SELECT_SIMT (tie), DFlash2 closed. One lesson recorded the hard way: a chat
+   screen alone never adopts a flag (HEAD_MIX_MULTI won its chat screen and lost its tier).
+40. **Parking protocol break found and closed** (11-27). The 11-26/27 tier sweeps derived
+   their configs from the daily JSON, which serves with parking ON (no
+   `--conversation-cache-mib` flag → engine default up to 8192 MiB over 4 slots); every row
+   through 11-23 ran parking off. With ~8 GiB of parked conversations the auto-sized expert
+   cache is smaller: a same-day arm-A pair measures 16k PP 1090.9/1087.2 (off) vs 989.0 (on),
+   -9.2% (32k about -1.9%; TG within noise). All campaign A/Bs shared one protocol, so the
+   flag decisions stand; absolute PP does not cross the break. Fix: every bench config now
+   carries `--conversation-cache-mib 0`. Redo: the `/tmp/parkoff-run.sh` pattern (arm A +
+   flag, 16k, 2 passes); results `strata_tier_pass_20261127_22*.json`; logs `/tmp/parkoff-*`.
     `strata_tier_pass_20261119_06*.json`…`_07*.json`.
 
 ---
