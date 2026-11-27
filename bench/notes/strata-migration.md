@@ -401,13 +401,19 @@ mostly the batch flip, not the other changes listed.
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
 │ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1061.6/103.6  │ 1054.8/99.6   │ 1048.4/94.7   │ 1037.8/93.7   │
 │        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-5.2%           │               │               │               │               │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-27  │ TG re-run arm A - pre-campaign env (parking off)             │ 1033.9/98.6   │ 1033.9/98.9   │ 1041.5/95.1   │ 1029.8/93.9   │
+├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
+│ 11-27  │ TG re-run arm C - adopted daily (parking off)                │ 1028.8/102.5  │ 1029.7/100.3  │ 1038.3/101.0  │ 1027.2/96.9   │
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
 The 11-24 to 11-27 TG campaign - the screens and closures, per-stage A/Bs, and the 4-arm ladder -
-is recorded in `bench/notes/tg-speedup-plan.md`; sections 6.36-6.40 cover the GDN promotion, the
-0.2.20 switch, the campaign, and the parking protocol break. The ladder's numbers are not listed
-in the table above because they ran the daily config's parking on (16k PP ~9% low against the
-parking-off rows; measured same-day pair: 1090.9/1087.2 off vs 989.0 on, §6.40). Every row in
-this table runs parking off.
+is recorded in `bench/notes/tg-speedup-plan.md`; sections 6.36-6.41 cover the GDN promotion, the
+0.2.20 switch, the campaign, the parking protocol break, and the parking-off re-run. Every row in
+this table runs parking off (`--conversation-cache-mib 0`). The 11-27 re-run rows are med-of-2
+counted passes (pass 1 = soak) taken at ~23:00: PP decays within a boot (1090 -> 1030 at 16k), so
+the re-run medians sit 1-3% under the 11-23 evening numbers on the same protocol - compare tiers,
+not absolute PP, across days. The ladder's arm B (stage) and arm D (wash) are not listed; the
+adopted stack is the arm C row.
 
 ### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
 
@@ -608,6 +614,7 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
     `~/git/wt-0216-f2` (branch `v620-0216-f2`); configs `~/strata-v620-iq3_s-T9-0216-{vanilla,f2}.json`
     (parking off); build flags `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030
     -DCMAKE_BUILD_TYPE=Release` with `cmake -S engine`; result JSONs
+    `strata_tier_pass_20261119_06*.json`…`_07*.json`.
 36. **GDN quad path promoted** (11-19/23). Config-env A/B on the 0.2.16 tip:
    `STRATA_GDN_HEAD=1` + `STRATA_GDN_PP=2` halve the GDN recurrence's per-layer launch cost
    (recurrence -51%); +4.1-5.2% PP on every tier, bit-exact. Promoted into generation 6. Redo:
@@ -636,7 +643,16 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
    flag decisions stand; absolute PP does not cross the break. Fix: every bench config now
    carries `--conversation-cache-mib 0`. Redo: the `/tmp/parkoff-run.sh` pattern (arm A +
    flag, 16k, 2 passes); results `strata_tier_pass_20261127_22*.json`; logs `/tmp/parkoff-*`.
-    `strata_tier_pass_20261119_06*.json`…`_07*.json`.
+41. **Parking-off re-certification of the adopted stack** (11-27, ~23:00). Arms A and C re-run
+    over the full tier with `--conversation-cache-mib 0` (3 passes each, med-of-2 counted):
+    TG +3.9/+1.4/+6.2/+3.1% (C vs A), PP neutral (-0.5 to -0.2%) - direction and size match the
+    parking-on ladder (+2.1/+3.2/+1.8/+3.7%), so the adoption stands under the correct protocol.
+    Two caveats kept on the record: (1) the tier harness samples nondeterministically (token
+    counts differ pass to pass within one arm), so bit-exactness remains a property of the
+    separate chat/logprob A/Bs, not this harness; (2) PP decays within a boot (pass 1 1090 ->
+    pass 3 ~1030 at 16k) and the counted medians sit 1-3% under the 11-23 evening parking-off
+    numbers - late-evening thermals. Redo: `/tmp/parkoff-tier.sh` (arms A and C, 3 passes, all
+    tiers); logs `/tmp/parkoff2-*`.
 
 ---
 

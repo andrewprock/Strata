@@ -1,7 +1,7 @@
 # TG speed-up plan (gfx1030 / V620)
 
 Recorded 2026-11-23 on branch `v620-gfx1030-tuned` (generation 6: 0.2.20-dev + F-2 + GDN env).
-This is the working document for the decode-side speed-up campaign; the migration doc's sections 6.39-6.40
+This is the working document for the decode-side speed-up campaign; the migration doc's sections 6.39-6.41
 hold the one-line records and point here. Each idea gets a Status update and its verdict appended
 below as it is measured, same discipline as the migration doc's experiments.
 
@@ -27,6 +27,9 @@ below as it is measured, same discipline as the migration doc's experiments.
   same-day arm-A pair measured 1089.0/1087.2 (off) vs 989.0 (on) - migration doc §6.40. The
   flag A/Bs above all shared one protocol and stand; their absolute PP is not comparable to
   the 11-23 Gen-6 medians (1061.6-1037.8, parking off).
+- Re-certification (11-27, parking off, med-of-2 counted): arms A and C re-run over the full
+  tier - TG +3.9/+1.4/+6.2/+3.1%, PP neutral. The adoption stands under the correct protocol
+  (migration doc §6.41; both rows are in the migration story table).
 ## The per-token budget
 
 Read from `engine/src/split/src/{engine.cu, moe.cuh, dense.cuh, qdot.cuh, iqdot_hip.cuh, model.cpp}`,
