@@ -401,20 +401,13 @@ mostly the batch flip, not the other changes listed.
 ├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
 │ 11-23  │ Generation 6 - daily: 0.2.20-dev + F-2 + GDN env             │ 1061.6/103.6  │ 1054.8/99.6   │ 1048.4/94.7   │ 1037.8/93.7   │
 │        │ med-of-3 (16k/32k), med-of-4 (64k/128k); +4.1-5.2%           │               │               │               │               │
-├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
-│ 11-27  │ TG ladder arm A - pre-campaign env (see tg-speedup-plan.md)  │ 989.0/99.7    │ 1037.7/97.1   │ 1045.0/97.0   │ 1036.0/94.2   │
-├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
-│ 11-27  │ TG ladder arm C - adopted daily (one-row + TSUM), +2.1-3.7%  │ 988.9/101.8   │ 1035.0/100.2  │ 1045.0/98.7   │ 1034.3/97.7   │
-├────────┼──────────────────────────────────────────────────────────────┼───────────────┼───────────────┼───────────────┼───────────────┤
-│ 11-27  │ TG ladder arm D - + HEAD_MIX_MULTI: tier wash, not adopted   │ 988.2/103.7   │ 1034.4/100.8  │ 1044.3/100.6  │ 1033.6/97.4   │
 └────────┴──────────────────────────────────────────────────────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
-The 11-24 to 11-27 TG campaign - the screens and closures, per-stage A/Bs, and the ladder's
-arm B behind the rows above - is recorded in `bench/notes/tg-speedup-plan.md`; sections 6.36-6.40
-cover the GDN promotion, the 0.2.20 switch, the campaign, and the parking protocol break. One
-protocol note on the table itself: every row through 11-23 ran parking off
-(`--conversation-cache-mib 0`); the 11-27 ladder rows ran the daily config's parking on, which
-costs 16k PP ~9% (measured same-day pair: 1090.9/1087.2 off vs 989.0 on, §6.40). Compare rows
-within a sweep set, not across the break.
+The 11-24 to 11-27 TG campaign - the screens and closures, per-stage A/Bs, and the 4-arm ladder -
+is recorded in `bench/notes/tg-speedup-plan.md`; sections 6.36-6.40 cover the GDN promotion, the
+0.2.20 switch, the campaign, and the parking protocol break. The ladder's numbers are not listed
+in the table above because they ran the daily config's parking on (16k PP ~9% low against the
+parking-off rows; measured same-day pair: 1090.9/1087.2 off vs 989.0 on, §6.40). Every row in
+this table runs parking off.
 
 ### 5.3 The three quantizations compared (2026-11-06, same generation-4 binary, benchmark parking)
 
