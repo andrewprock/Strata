@@ -10,7 +10,20 @@ below as it is measured, same discipline as the migration doc's experiments.
 - Adopted, tier-confirmed: `STRATA_NO_MMVQ_ROWS2=1` (stage 1) + `STRATA_TSUM=1` (stage 1b).
   The confirmation ladder measures the stack at +2.1/+3.2/+1.8/+3.7% TG (16k/32k/64k/128k),
   PP +-0.4%, bit-exact, no flag interactions. Both are in the daily config.
+- Adopted, tier-confirmed (11-28): `STRATA_NO_PCIE_STAGING=1` - build-list item 1, the zero-miss
+  staging gate. With `--pcie-frac 0` the pool plans no PCIe share, but the partial-residency
+  branch still enqueued the staging fetch (384 empty blocks), the rebase and the PCIe grouped
+  run per layer and group; with the flag the graph skips them at capture time (bit-exact,
+  graph-safe). Chat screen +0.1/+1.3/+1.4/+0.8% (PCS vs A, med-of-2 rounds); full tier
+  (parking off, med-of-2 counted) +TG -0.8/+1.0/+1.9/+2.2%, PP neutral, ahead in 9 of 12
+  per-pass-per-tier pairs. In the daily config. Migration doc §6.42.
 - Screened, NOT adopted: `STRATA_HEAD_MIX_MULTI=1` - a tier wash twice over (its own sweep and
+  the ladder's D-C step).
+- Code-complete, bit-exact, wash (11-28): build-list item 2, the native router for the windowed
+  routing path (`STRATA_ROUTE_WINDOW_NATIVE=1`, one `route_multi` per window instead of n
+  per-token `moe_route` launches). Chat screen dead even (decode 100.0/99.8, 68.7/68.6,
+  71.8/71.9, 73.4/73.3); per-token routing was never the bottleneck at T<=8. Disposition
+  pending: keep merged as a clean opt-in fix, decide at adoption time.
   the ladder's D-C step).
 - Closed: EXPDEC (idea 11), the AMD EXP_MODE layouts (idea 12), `STRATA_Q8_PACKED` (no effect on
   gfx1030), `STRATA_SELECT_SIMT` (tie - keep 1), DFlash2 (measured slower than MTP twice
@@ -18,8 +31,10 @@ below as it is measured, same discipline as the migration doc's experiments.
 - Aborted, no verdict: the `STRATA_QFUSE_HC` chat screen (see the section at the end).
 - Ideas 1-4 (pack rebuilds) stay declined by choice; idea 10 (second card) is hardware, not code.
 - Next, the build list, cheapest first: the zero-miss staging-copy gate (device-side gated copy,
-  ~+0.5-1%), batched verify routing for the native 512x10 router (+2-4% est.), the expert-kernel
-  precompute hoist (+3-7% est.), then phase 2 B6X-Q8_0 only if the re-run gap arithmetic says so.
+- Build list progress: item 1 (zero-miss staging gate) adopted 11-28. Item 2 (batched verify
+  routing, +2-4% est.) is code-complete, bit-exact, and measured a wash - see above. Next:
+  item 3, the expert-kernel precompute hoist (+3-7% est., the biggest lever), then phase 2
+  B6X-Q8_0 only if the re-run gap arithmetic says so.
 - The daily driver serves the adopted stack; HEAD_MIX_MULTI must not be added on the strength of
   its chat screen alone.
 - Benchmark protocol: every tier/bench config must carry `--conversation-cache-mib 0` (parking
@@ -27,6 +42,10 @@ below as it is measured, same discipline as the migration doc's experiments.
   same-day arm-A pair measured 1089.0/1087.2 (off) vs 989.0 (on) - migration doc §6.40. The
   flag A/Bs above all shared one protocol and stand; their absolute PP is not comparable to
   the 11-23 Gen-6 medians (1061.6-1037.8, parking off).
+- A/B harness gotchas: (1) the daily config's top-level `api_key` makes `ab_engine.py`'s
+  `wait_ready` hang on the 401 - A/B configs must be keyless (the `/tmp/route-window-base.json`
+  pattern); (2) run the tools with the repo venv python (`~/git/Strata/.venv/bin/python`), the
+  system python lacks the `regex` module.
 - Re-certification (11-27, parking off, med-of-2 counted): arms A and C re-run over the full
   tier - TG +3.9/+1.4/+6.2/+3.1%, PP neutral. The adoption stands under the correct protocol
   (migration doc §6.41; both rows are in the migration story table).

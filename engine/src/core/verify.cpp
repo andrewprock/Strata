@@ -488,6 +488,16 @@ bool device_is_sm75() {
 #endif
 }
 
+// item 1 (zero-miss staging gate): when the pool plans no PCIe share (--pcie-frac 0), the staging fetch, the rebase
+// and the PCIe grouped run per layer and group would all exit on counts[2] == 0: opt-in skip, capture-time, bit-exact
+bool no_pcie_staging_on() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_NO_PCIE_STAGING");
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : 0;
+    }();
+    return env != 0;
+}
+
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
     static const int env = [] {
@@ -2882,7 +2892,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            if (sink_.pcie_mode == 2 && !no_pcie_share_ && no_pcie_staging_on()) {         // stage it with a copy kernel, then point at staging
+                // item 1 (zero-miss staging gate): --pcie-frac 0 plans no PCIe share (the pool's pick() is 0), so the
+                // staging fetch, the rebase and the PCIe grouped run would all exit on counts[2] == 0: skip them at
+                // capture time (graph-safe, bit-exact: they wrote nothing)
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
@@ -2892,7 +2905,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
+            if (!no_pcie_share_ || !no_pcie_staging_on())
+                grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             if (!l2pf.empty() && !device_plan_ && l + 1 < le_ && l2pf[(size_t) (l + 1)].n > 0 && sh_stream_on() && sh_cs_ != nullptr &&
                 ev_fork_ != nullptr && ev_join_ != nullptr) {

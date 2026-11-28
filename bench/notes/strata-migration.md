@@ -653,6 +653,21 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
     pass 3 ~1030 at 16k) and the counted medians sit 1-3% under the 11-23 evening parking-off
     numbers - late-evening thermals. Redo: `/tmp/parkoff-tier.sh` (arms A and C, 3 passes, all
     tiers); logs `/tmp/parkoff2-*`.
+42. **Build-list item 1: the zero-miss staging gate adopted** (11-28, early). With
+    `--pcie-frac 0` the pool never plans a PCIe share, but the partial-residency expert branch
+    still enqueued three per-layer-per-group launches that all exit on the device count
+    (counts[2] == 0): the staging fetch (`fetch_blobs`, 384 blocks x 256 threads), the pointer
+    rebase, and the PCIe grouped run. The new opt-in `STRATA_NO_PCIE_STAGING=1` skips them at
+    graph-capture time (`no_pcie_share_` already existed for exactly this condition) - three
+    fewer nodes per layer and group, bit-exact by construction (they wrote nothing). Parity:
+    full-text greedy identical on 5 prompts. Chat screen (A vs PCS, med-of-2 rounds): decode
+    +0.1/+1.3/+1.4/+0.8%. Full tier (parking off, 3 passes, med-of-2 counted, arm A = daily):
+    TG -0.8/+1.0/+1.9/+2.2% (16k/32k/64k/128k), PP neutral (-0.5 to -0.1%), ahead in 9 of 12
+    per-pass-per-tier pairs. Adopted into the daily config. Redo: `/tmp/pcs-tier.sh` (arms A
+    and B); parity `/tmp/pcs_parity.py`; logs `/tmp/pcs-*`. In the same session build-list
+    item 2 (batched verify routing for the native 512x10 router, `STRATA_ROUTE_WINDOW_NATIVE=1`)
+    was completed and measured a dead-even chat wash (100.0/99.8 ... 73.4/73.3) - per-token
+    routing was never the bottleneck at T<=8; it stays merged as a clean opt-in fix.
 
 ---
 
