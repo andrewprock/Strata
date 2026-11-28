@@ -24,17 +24,18 @@ below as it is measured, same discipline as the migration doc's experiments.
   per-token `moe_route` launches). Chat screen dead even (decode 100.0/99.8, 68.7/68.6,
   71.8/71.9, 73.4/73.3); per-token routing was never the bottleneck at T<=8. Disposition
   pending: keep merged as a clean opt-in fix, decide at adoption time.
-  the ladder's D-C step).
 - Closed: EXPDEC (idea 11), the AMD EXP_MODE layouts (idea 12), `STRATA_Q8_PACKED` (no effect on
   gfx1030), `STRATA_SELECT_SIMT` (tie - keep 1), DFlash2 (measured slower than MTP twice
   upstream; the daily drafts with the MTP head).
 - Aborted, no verdict: the `STRATA_QFUSE_HC` chat screen (see the section at the end).
 - Ideas 1-4 (pack rebuilds) stay declined by choice; idea 10 (second card) is hardware, not code.
-- Next, the build list, cheapest first: the zero-miss staging-copy gate (device-side gated copy,
 - Build list progress: item 1 (zero-miss staging gate) adopted 11-28. Item 2 (batched verify
-  routing, +2-4% est.) is code-complete, bit-exact, and measured a wash - see above. Next:
-  item 3, the expert-kernel precompute hoist (+3-7% est., the biggest lever), then phase 2
-  B6X-Q8_0 only if the re-run gap arithmetic says so.
+  routing, +2-4% est.) is code-complete, bit-exact, and measured a wash - see above. Item 3,
+  taken as plan idea 1 (the expert-profile rebuild on the real workload distribution), measured
+  a wash too - the verdict below. The precompute-hoist reading of item 3 was screened first
+  (GU_ROWS 32->128 build to cut staging replication 40x->10x: chat A/B wash, 11-28), so
+  expert-kernel staging is not a large TG share either. With items 1-3 measured the engine-only
+  build list is exhausted; phase 2 B6X-Q8_0 only if the re-run gap arithmetic says so.
 - The daily driver serves the adopted stack; HEAD_MIX_MULTI must not be added on the strength of
   its chat screen alone.
 - Benchmark protocol: every tier/bench config must carry `--conversation-cache-mib 0` (parking
@@ -70,7 +71,7 @@ no CUDA graphs), and latency-bound small kernels. TG is not noise here; there is
 ┌────┬──────────────────────────────────────────────────────────────┬──────────────┬────────────┬──────────────┐
 │ #  │ Idea                                                         │ Expect       │ Cost       │ Status       │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
-│ 1  │ Expert-cache misses: rebuild expert-profile.bin on the real  │ +3-7%        │ cfg        │ not started  │
+│ 1  │ Expert-cache misses: rebuild expert-profile.bin on the real  │ +3-7%        │ cfg        │ WASH 11-28   │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
 │ 2  │ Re-pack forced-Q8_0 dense below Q8_0 (qkvz, ssm_out, wo, hc, │ +5-10%       │ med        │ not started  │
 ├────┼──────────────────────────────────────────────────────────────┼──────────────┼────────────┼──────────────┤
@@ -355,3 +356,37 @@ long 73.7 vs qfuse 94.0 / 68.9 / 69.3 / 63.9 decode tok/s - qfuse behind on 3 of
 but a single round sits inside the +-3-4% chat noise and cannot carry a verdict either way.
 Status: incomplete - rerun with ab_engine.py (ref vs STRATA_QFUSE_HC=1, 3 rounds) before judging.
 It is the last unscreened free flag, and its only data leans negative.
+
+## Idea 1 (2026-11-28): expert-profile rebuild on the bench trace - wash, rejected
+
+The plan's premise: decode TG loses to expert-cache misses (89.7% hit) and a profile ranked by the
+real workload's routing fixes the placement. Measured in three steps.
+
+1. Oracle trace (`collect_profile_traces.py --mode routing`, 3 one-shot runs on the tier bench's own
+   prompt texts - regular-32k/64k/128k, uuid-prefixed, 512 decode tokens each): the decode regime
+   touches only ~240-260 distinct experts per layer (min 174, max 301), ~5,300-5,600 routed entries
+   per layer. A perfect per-layer top-256 profile covers 99.85-99.96% of routed entries at the
+   12,334-slot cache - the working set fits; placement is not structurally impossible.
+2. Rebuilt profile (`make_profile_mix.py` on the 3 traces, weight 1:1:1 ->
+   `terminal/data/expert-profile-bench.bin`): static coverage at 12,334 slots = **99.88%** vs the
+   shipped profile's **52.49%** (whose slots are also uneven across layers, 168-368). Top-set
+   overlap only 6,510 of 12,334 - a genuinely different ranking, not a nudge.
+3. Full tier A/B (`ep-tier.sh`, parking off, 3 passes, med-of-2 counted; arm A = shipped profile,
+   arm B = traced profile, otherwise byte-identical configs): TG +0.2/+1.2/-3.8/-0.8%
+   (16k/32k/64k/128k) - wash inside the +/-3-4% band, B ahead 2 of 4 tiers. PP neutral.
+
+Direct check (`STRATA_VERIFY_PROFILE=1`, one 32k request per profile on a fresh boot): 87.6% hit
+(shipped) vs 89.0% (traced). A 47-point better static seed moves the runtime hit rate ~1.4 points:
+the adaptive tier converges past the profile within the request itself, so the steady-state hit
+rate is the adaptive policy's, not the seed's. REJECTED: the profile is only a warm-up seed, and
+even the warm-up (PP) shows nothing at the tier; the remaining ~10% misses are churn-policy
+constrained and their cost overlaps with GPU work (the CPU pool) rather than stalling the window.
+The plan's "+3-7%, biggest lever" estimate came from the expert-profile gap arithmetic - falsified
+on this rig. Provenance: traces `/tmp/bench-traces/c0{0,1,2}.trace` (ephemeral), tier results
+`strata_tier_pass_20261128_07*.json`, logs `/tmp/ep-{A,B}-r*.log`.
+
+Incident for the record: during the direct check a script bug (`json.dump` to the profile path)
+briefly overwrote both profile files (08:09, after the tier A/B had finished). Both restored the
+same morning - `git checkout` for the shipped one, a re-run of `make_profile_mix.py` for the traced
+one - and the hit check re-run on the restored files. No engine state beyond the two profile files
+was touched.

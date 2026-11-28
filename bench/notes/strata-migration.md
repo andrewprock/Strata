@@ -668,6 +668,27 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
     item 2 (batched verify routing for the native 512x10 router, `STRATA_ROUTE_WINDOW_NATIVE=1`)
     was completed and measured a dead-even chat wash (100.0/99.8 ... 73.4/73.3) - per-token
     routing was never the bottleneck at T<=8; it stays merged as a clean opt-in fix.
+43. **Build-list item 3: the expert-profile rebuild on the bench trace** (11-28). The plan's
+    item-3 estimate (+3-7%, "the gap is expert-cache miss stalls") traces to plan idea 1:
+    rebuild `expert-profile.bin` on the real workload's routing. The kernel-staging reading was
+    screened first and washed (GU_ROWS 32->128 build, chat A/B wash) - staging replication is
+    not a large TG share. Then the profile work: `collect_profile_traces.py --mode routing` on
+    the tier bench's own prompt texts (3 one-shot runs, 512 decode tokens each) gives an oracle
+    answer - the decode regime touches only ~240-260 distinct experts per layer, so a perfect
+    per-layer top-256 profile covers 99.9% of routed entries at the 12,334-slot cache. The
+    rebuilt profile (`make_profile_mix.py`, 1:1:1) measures 99.88% static coverage vs the
+    shipped profile's 52.5% - a genuinely different ranking (6,510/12,334 pair overlap) - and
+    the full tier A/B is a wash: TG +0.2/+1.2/-3.8/-0.8% (16k/32k/64k/128k), parking off,
+    3 passes, med-of-2 counted, B ahead 2 of 4 tiers. The direct check explains it:
+    `STRATA_VERIFY_PROFILE=1` on a fresh boot, one 32k request per profile, 87.6% vs 89.0% hit -
+    the adaptive tier converges past the seed within the request itself, so the steady-state
+    hit rate belongs to the adapt policy, not the profile. The remaining ~10% misses are
+    churn-policy constrained and their cost overlaps with GPU work instead of stalling the
+    window. Idea 1 REJECTED; the plan's expert-profile gap arithmetic is falsified on this rig.
+    Redo: `/tmp/ep-tier.sh`, `/tmp/vp-run.sh`; results `strata_tier_pass_20261128_07*.json`.
+    Incident: a script bug during the direct check briefly overwrote both profile files
+    (after the tier A/B finished); both restored - `git checkout` and a re-run of the tool -
+    and the check re-run on the restored files.
 
 ---
 
