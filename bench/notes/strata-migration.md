@@ -678,7 +678,7 @@ pre-rewrite original in git (`c8d3f3b2`) which has the full logs and tables.
     per-layer top-256 profile covers 99.9% of routed entries at the 12,334-slot cache. The
     rebuilt profile (`make_profile_mix.py`, 1:1:1) measures 99.88% static coverage vs the
     shipped profile's 52.5% - a genuinely different ranking (6,510/12,334 pair overlap) - and
-    the full tier A/B is a wash: TG +0.2/+1.2/-3.8/-0.8% (16k/32k/64k/128k), parking off,
+    the full tier A/B is a wash: TG +0.2/+1.2/-1.2/-0.8% (16k/32k/64k/128k), parking off,
     3 passes, med-of-2 counted, B ahead 2 of 4 tiers. The direct check explains it:
     `STRATA_VERIFY_PROFILE=1` on a fresh boot, one 32k request per profile, 87.6% vs 89.0% hit -
     the adaptive tier converges past the seed within the request itself, so the steady-state

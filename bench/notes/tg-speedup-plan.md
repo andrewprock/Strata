@@ -372,7 +372,7 @@ real workload's routing fixes the placement. Measured in three steps.
    shipped profile's **52.49%** (whose slots are also uneven across layers, 168-368). Top-set
    overlap only 6,510 of 12,334 - a genuinely different ranking, not a nudge.
 3. Full tier A/B (`ep-tier.sh`, parking off, 3 passes, med-of-2 counted; arm A = shipped profile,
-   arm B = traced profile, otherwise byte-identical configs): TG +0.2/+1.2/-3.8/-0.8%
+   arm B = traced profile, otherwise byte-identical configs): TG +0.2/+1.2/-1.2/-0.8%
    (16k/32k/64k/128k) - wash inside the +/-3-4% band, B ahead 2 of 4 tiers. PP neutral.
 
 Direct check (`STRATA_VERIFY_PROFILE=1`, one 32k request per profile on a fresh boot): 87.6% hit
