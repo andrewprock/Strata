@@ -354,8 +354,15 @@ mid-run when the headmix tier sweep took the server. One complete round exists
 (logs/ab-qfuse.log, round 0, single measurements): ref chat0 99.4 / chat1 68.4 / chat2 71.6 /
 long 73.7 vs qfuse 94.0 / 68.9 / 69.3 / 63.9 decode tok/s - qfuse behind on 3 of 4 (long -13%),
 but a single round sits inside the +-3-4% chat noise and cannot carry a verdict either way.
-Status: incomplete - rerun with ab_engine.py (ref vs STRATA_QFUSE_HC=1, 3 rounds) before judging.
-It is the last unscreened free flag, and its only data leans negative.
+CLOSED 11-28 (negative): the ab_engine rerun (3 rounds, med-of-3 decode tok/s, A vs QFUSE_HC=1)
+puts the fusion behind on 3 of 4 (chat0 93.9 vs 100.5, chat2 69.7 vs 72.2, long 65.3 vs 73.4 = -11%,
+chat1 even). The flag list is now fully screened.
+
+Adaptive-tier policy screen (11-28, from the idea-1 findings - the ~10% misses are churn-policy
+constrained): EAGER arm = --adapt-min-gain 0.5 --adapt-every 2 (defaults 1.5 / 4), 3 rounds med-of-3
+vs the same A baseline: chat0 100.9 (+0.4%), chat1 71.6 (+4.1%), chat2 73.3 (+1.5%), long 67.0 (-8.7%).
+More eager adaptation buys a little on short chats and costs -8.7% on long decode - the swap work
+outweighs the hit-rate gain. Wash leaning negative; not adopted, no tier run.
 
 ## Idea 1 (2026-11-28): expert-profile rebuild on the bench trace - wash, rejected
 
