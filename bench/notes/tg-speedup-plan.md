@@ -284,6 +284,33 @@ Target: dense+head ~6-8 ms/window of the ~14 ms TG window at 46-64% of peak vs g
 83-84% - closing even half is ~+5-10% TG, stacking on stage 1's +1-5%. The ceiling is extrapolated from
 Cost: days-scale. Status: phase 1 DONE (below), phase 2 (the kernel) next.
 
+
+Recon update (11-28, before the first stage-2 session) - the text above predates the TSUM
+adoption and needs these corrections:
+
+- The multi-column kernel EXISTS and is ADOPTED. The daily's projection path is
+  native_mmvq.cu's P3 ncols=2..8 kernels: `native_mmvq_multi_kernel` (~:1260),
+  `SmallTraits<Q80Block, 8>` (:1192), `Q80Block` (:121, static_assert :147), `small_q8_dot`
+  (:833), TSUM in `s26_tsum.cuh`. The boot log confirms it: "300 native projection matrices,
+  2018.88 MiB of weights, served natively". `s2_gemv_q8.cu` is a 96-line round-186 correctness
+  kernel (dequantizing, dp4a deferred) - NOT the daily head path.
+- Stage 2 is therefore wave64 MICRO-OPTIMIZATION of the adopted kernel, not a new kernel: the
+  bench has it at 46-64% of the 672 GB/s peak (gfx12: 83-84%), and the remaining gap is
+  layout/occupancy/memory-pipeline, not missing instructions.
+- Instruction facts: on HIP, `STRATA_DP4A` maps to the real `__dp4a` (v_dot4_i32_i8, RDNA2);
+  dp4a.hpp's 4x-v_mad fallback is CUDA/Pascal-only. 64-lane __shfl_xor reductions already run
+  (native_mmvq.cu:2536). Do not budget a session for porting v_dot4 - it is already compiled in.
+- Column invariant: adding columns only scales activation loads, never weight re-reads, and every
+  column is bitwise equal to a single-column call. Any variant must keep it: changing the
+  thread->block mapping changes the per-thread accumulation order and breaks parity.
+- Harness: q8_gemv_bench drives the REAL engine call (native_mmvq) over the true shapes (GDN
+  qkv/gate, QSA q, HC, shared, head 2560->248320), --cols picks the widths, --packed toggles the
+  registered packed path with a bitwise check. It CANNOT run while the daily server holds VRAM
+  (HSA alloc failure) - stop ~/bin/strata-serve first, restart after.
+- Variant checklist for the sweep (bench-first, one knob at a time, memcmp-exact): warps per
+  block (NW), ROWS per block for Q8_0, threads per 32-byte block (T=4 today; T=8 with one int
+  per thread), activation staging width, unroll factor. Grid rule today: ROWS<=2 -> 4 minBlocks,
+  else 1.
 Phase 1 screen (2026-11-26, q8_gemv_bench --bw 672 on the V620, cold weights, memcmp-exact, 30 reps):
 - STRATA_Q8_PACKED=1 (the packed Q8_0 decode layout, +10-12% on gfx1151 dense shapes) has NO effect on
   gfx1030: within +-1% at every shape x column count, bitwise identical. Closed - the gfx1151 win does not
